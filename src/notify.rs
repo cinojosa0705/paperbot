@@ -84,7 +84,9 @@ const COMMANDS: &[(&str, &str)] = &[
 
 impl Commander {
     pub fn from_env(api: Api, feed: Option<Feed>, state_path: PathBuf, ledger_path: PathBuf) -> Option<Self> {
-        if std::env::var("PAPERBOT_TG_COMMANDS").map(|v| v == "0").unwrap_or(false) {
+        // only one process may long-poll Telegram: `paperbot tg-serve` by default; the engine and the
+        // GUI join in only with PAPERBOT_TG_COMMANDS=1
+        if std::env::var("PAPERBOT_TG_COMMANDS").map(|v| v != "1").unwrap_or(true) {
             return None;
         }
         Some(Self {

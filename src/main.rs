@@ -36,6 +36,8 @@ enum Cmd {
     Run(RunArgs),
     /// Emergency: close every open position in one intent.
     CloseAll,
+    /// Serve the Telegram commands (the one process that should poll); no trading.
+    TgServe,
     /// Print what the Telegram command bot would answer (no Telegram needed).
     #[command(hide = true)]
     TgReply { cmd: String },
@@ -118,7 +120,16 @@ async fn main() -> Result<()> {
             .context("engine")?;
             eng.close_all().await?;
         }
+        Cmd::TgServe => {
+            std::env::set_var("PAPERBOT_TG_COMMANDS", "1");
+            let c = Commander::from_env(api, Some(feed::Feed::spawn()), cli.state.clone(), cli.ledger.clone())
+                .context("PAPERBOT_TG_TOKEN / PAPERBOT_TG_CHAT not set")?;
+            println!("serving Telegram commands for chat {}", std::env::var("PAPERBOT_TG_CHAT").unwrap_or_default());
+            c.spawn();
+            tokio::signal::ctrl_c().await?;
+        }
         Cmd::TgReply { cmd } => {
+            std::env::set_var("PAPERBOT_TG_COMMANDS", "1");
             std::env::set_var("PAPERBOT_TG_TOKEN", std::env::var("PAPERBOT_TG_TOKEN").unwrap_or("x".into()));
             std::env::set_var("PAPERBOT_TG_CHAT", std::env::var("PAPERBOT_TG_CHAT").unwrap_or("0".into()));
             let c = Commander::from_env(api, Some(feed::Feed::spawn()), cli.state.clone(), cli.ledger.clone()).context("commander")?;

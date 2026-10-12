@@ -85,9 +85,9 @@ bust guard for the chosen move) and **applies from the next pair** — never und
 
 All three surfaces share one file, `params.json` next to `state.json`: Telegram `/set` and the GUI's
 **apply** button write it, the engine re-reads it at the top of every cycle, and the GUI's strategy
-header shows what's live. The CLI flags only seed the file the first time. The poller runs
-in whichever process has the feed (the GUI, or CLI `run`); only one process should poll at a time
-(`PAPERBOT_TG_COMMANDS=0` disables it in the other). `paperbot tg-reply status` prints a reply offline.
+header shows what's live. The CLI flags only seed the file the first time. Run the responder as its own
+process — `paperbot tg-serve` — so it works whether or not the farm or the GUI is up; the engine and
+the GUI only poll if `PAPERBOT_TG_COMMANDS=1` (Telegram allows one poller at a time). `paperbot tg-reply status` prints a reply offline.
 
 When both are set the engine pings on start, every pair open, every cycle result (pnl, PAPER minted,
 running PAPER/$), aborts (naked leg, wide entry gap, a leg vanishing), the stop reason, and fatal
