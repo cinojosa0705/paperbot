@@ -159,6 +159,25 @@ impl Api {
         })
     }
 
+    /// Measured mint-rate decay over the last 24h (fraction, e.g. 0.18), from the hourly supply series.
+    pub async fn decay_24h(&self, now: &Summary) -> Result<f64> {
+        let v = self.get_value("/query/protocol/history?interval=1h").await?;
+        let sup = v["columns"]["paperSupply"].as_array().ok_or_else(|| anyhow!("no paperSupply"))?;
+        let n = sup.len();
+        if n < 25 {
+            anyhow::bail!("not enough history");
+        }
+        let tail_now = FLAT_RATE * TAIL_SCALE_USD * now.tail_progress_usd / (TAIL_SCALE_USD + now.tail_progress_usd);
+        let flat = (now.supply - tail_now).max(0.0);
+        let s24 = sup[n - 25].as_f64().unwrap_or(0.0) - flat;
+        if s24 <= 0.0 {
+            anyhow::bail!("supply 24h ago below the flat region");
+        }
+        let h24 = TAIL_SCALE_USD * s24 / (FLAT_RATE * TAIL_SCALE_USD - s24);
+        let r24 = FLAT_RATE * (TAIL_SCALE_USD / (TAIL_SCALE_USD + h24)).powi(2);
+        Ok(1.0 - now.mint_rate() / r24)
+    }
+
     pub async fn trading_state(&self) -> Result<TradingState> {
         let v = self.get_value("/state/trading").await?;
         let instruments = v["instruments"]

@@ -91,11 +91,13 @@ pub struct Params {
     pub rate_floor: f64,
     pub max_cycles: Option<u64>,
     pub paused: bool,
+    /// set by /liquidate: the engine closes its pair, clears the flag and stays paused
+    pub liquidate: bool,
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Self { market: "auto".into(), move_pct: 0.5, buffer_pct: 25.0, capital_fraction: 1.0, drawdown_stop_pct: 60.0, rate_floor: 10.0, max_cycles: None, paused: false }
+        Self { market: "auto".into(), move_pct: 0.5, buffer_pct: 25.0, capital_fraction: 1.0, drawdown_stop_pct: 60.0, rate_floor: 10.0, max_cycles: None, paused: false, liquidate: false }
     }
 }
 
@@ -148,4 +150,17 @@ impl Params {
             self.drawdown_stop_pct, self.rate_floor, self.max_cycles.map(|m| m.to_string()).unwrap_or("off".into())
         )
     }
+}
+
+/// Engine liveness: a file whose mtime the engine bumps every second while it runs.
+pub fn heartbeat_path(state_path: &Path) -> PathBuf {
+    state_path.with_file_name("heartbeat")
+}
+pub fn heartbeat_touch(state_path: &Path) {
+    let _ = std::fs::write(heartbeat_path(state_path), crate::sign::now_secs().to_string());
+}
+/// Seconds since the engine last beat, if ever.
+pub fn heartbeat_age(state_path: &Path) -> Option<u64> {
+    let t: u64 = std::fs::read_to_string(heartbeat_path(state_path)).ok()?.trim().parse().ok()?;
+    Some(crate::sign::now_secs().saturating_sub(t))
 }

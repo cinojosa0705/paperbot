@@ -5,7 +5,7 @@ use crate::feed::Feed;
 use crate::notify::Notifier;
 use crate::positions::Chain;
 use crate::sign::{self, Close, Intent, OpenPosition};
-use crate::state::{ledger_append, InFlight, Params, State};
+use crate::state::{heartbeat_touch, ledger_append, InFlight, Params, State};
 use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::Eip712Domain;
@@ -148,7 +148,7 @@ impl Engine {
     pub fn params_from_args(a: &RunArgs) -> Params {
         Params {
             market: a.market.clone(), move_pct: a.move_pct, buffer_pct: a.buffer_pct, capital_fraction: a.capital_fraction,
-            drawdown_stop_pct: a.drawdown_stop_pct, rate_floor: a.rate_floor, max_cycles: a.max_cycles, paused: false,
+            drawdown_stop_pct: a.drawdown_stop_pct, rate_floor: a.rate_floor, max_cycles: a.max_cycles, paused: false, liquidate: false,
         }
     }
     /// Overlay live params onto the run args; true if anything changed.
@@ -203,10 +203,18 @@ impl Engine {
             self.watch_and_close(pair, d, buf).await?;
         }
 
+        if let Some(exp) = self.st.session_expiry {
+            let left = exp.saturating_sub(sign::now_secs());
+            if left < 3 * 86_400 {
+                self.notify(format!("⚠️ session key expires in {}h — re-register soon", left / 3600));
+            }
+        }
         let mut stale_logged = false;
         let (mut paused_logged, mut bad_params_logged) = (false, false);
         let mut open_failures = 0u32;
+        let mut dd_alerted = [false, false];
         loop {
+            heartbeat_touch(&self.state_path);
             if self.stopping() {
                 self.stop_note("stop requested");
                 break;
@@ -256,6 +264,13 @@ impl Engine {
                 break;
             }
             let balance = self.balance().await?;
+            let dd = 1.0 - balance as f64 / start_balance as f64;
+            for (i, m) in [0.25, 0.5].iter().enumerate() {
+                if dd >= *m && !dd_alerted[i] {
+                    dd_alerted[i] = true;
+                    self.notify(format!("📉 drawdown {:.0}%: balance ${:.2} from ${:.2}", dd * 100.0, balance as f64 / E18, start_balance as f64 / E18));
+                }
+            }
             if balance <= floor {
                 self.stop_note(&format!("drawdown stop at ${:.2}", balance as f64 / E18));
                 break;
@@ -511,6 +526,7 @@ impl Engine {
         let mut poll = tokio::time::interval(Duration::from_secs(1));
         let mut shutdown = self.shutdown.clone();
         let mut last_move = 0.0;
+        let mut liquidate = false;
         loop {
             tokio::select! {
                 _ = rx.changed() => {
@@ -526,6 +542,12 @@ impl Engine {
                     }
                 }
                 _ = poll.tick() => {
+                    heartbeat_touch(&self.state_path);
+                    if Params::load(&Params::path(&self.state_path)).map(|p| p.liquidate).unwrap_or(false) {
+                        tracing::warn!("liquidate requested; closing the pair");
+                        liquidate = true;
+                        break;
+                    }
                     if self.args.dry_run { continue; }
                     let row = self.api.account_row(self.user).await?;
                     if row.open_positions < pair.ids.len() as u32 {
@@ -553,6 +575,15 @@ impl Engine {
         self.clear_in_flight()?;
         self.st.cycles_done += 1;
         self.st.save(&self.state_path)?;
+        if liquidate {
+            let pp = Params::path(&self.state_path);
+            if let Some(mut p) = Params::load(&pp) {
+                p.liquidate = false;
+                p.paused = true;
+                let _ = p.save(&pp);
+            }
+            self.notify("🛑 <b>liquidated</b>: pair closed by request, farm paused".to_string());
+        }
         Ok(())
     }
 
