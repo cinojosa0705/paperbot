@@ -60,7 +60,7 @@ Ctrl-C closes any open pair, flushes the ledger and exits. If the process dies m
 ```
 
 A compact iced window in papertrade's uwu dress: protocol chips (mint rate, LP, queue, supply),
-account (balance, queued, open positions, PAPER held, session expiry), the in-flight pair with a live
+wallet (HyperCore spot and perp USDC, papertrade balance, queued, margin in use, PAPER held, session expiry), the in-flight pair with a live
 move-to-trigger bar, the strategy card (leverage, bust guard, BTC vs ETH keep / cost / PAPER-per-$ and
 realised vol), a live mid sparkline with entry and trigger bands, and the cycle ledger. It reads the
 same files and endpoints the bot does and never signs or posts anything; pass the same `--move` /

@@ -12,7 +12,7 @@ use paperbot::feed::Feed;
 use paperbot::notify::Notifier;
 use paperbot::positions::Chain;
 use paperbot::state::{Params, State};
-use paperbot::{session, sign, RunArgs, CHAIN_ID, EXCHANGE, USDC};
+use paperbot::{session, sign, RunArgs, CHAIN_ID, EXCHANGE};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -422,12 +422,12 @@ impl App {
                     let api = self.api.clone();
                     tasks.push(Task::perform(async move { api.account_row(u).await.map_err(|e| e.to_string()) }, Message::Account));
                     if self.ticks % 9 == 1 {
-                        let (api, chain) = (self.api.clone(), self.chain.clone());
+                        let api = self.api.clone();
                         tasks.push(Task::perform(
                             async move {
-                                let evm = chain.erc20_balance(USDC, u).await.map_err(|e| e.to_string())? as f64 / 1e6;
-                                let core = api.hypercore_spot_usdc(u).await.unwrap_or(0.0);
-                                Ok((evm, core))
+                                let spot = api.hypercore_spot_usdc(u).await.map_err(|e| e.to_string())?;
+                                let (perp, _) = api.hypercore_perp_usdc(u).await.unwrap_or((0.0, 0.0));
+                                Ok((spot, perp))
                             },
                             Message::Balances,
                         ));
@@ -501,8 +501,8 @@ impl App {
             _ => kv("session key", "none".into(), RED),
         };
         let mut wallet_col = column![
-            kv("HyperEVM USDC", self.evm_usdc.map(|v| format!("${v:.2}")).unwrap_or("…".into()), FG),
-            kv("HyperCore spot USDC", self.core_usdc.map(|v| format!("${v:.2}")).unwrap_or("…".into()), FG),
+            kv("HyperCore spot USDC", self.evm_usdc.map(|v| format!("${v:.2}")).unwrap_or("…".into()), FG),
+            kv("HyperCore perp USDC", self.core_usdc.map(|v| format!("${v:.2}")).unwrap_or("…".into()), FG),
             kv("papertrade balance", self.account.as_ref().map(|a| format!("${:.2}", a.balance_raw as f64 / E18)).unwrap_or("…".into()), FG),
             kv("queued", self.account.as_ref().map(|a| format!("${:.2}", a.queued_raw as f64 / E18)).unwrap_or("…".into()), FG2),
             kv("margin in use", format!("${in_use:.2}"), if in_use > 0.0 { PINK } else { FG2 }),

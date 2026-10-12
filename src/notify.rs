@@ -317,6 +317,9 @@ impl Commander {
                 }
                 Err(e) => s.push_str(&format!("account: {e}\n")),
             }
+            let spot = self.api.hypercore_spot_usdc(u).await.unwrap_or(0.0);
+            let (perp, _) = self.api.hypercore_perp_usdc(u).await.unwrap_or((0.0, 0.0));
+            s.push_str(&format!("wallet: HyperCore spot {} · perp {}\n", money(spot), money(perp)));
         } else {
             s.push_str("account: no session registered\n");
         }

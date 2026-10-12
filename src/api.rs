@@ -223,6 +223,20 @@ impl Api {
             .unwrap_or(0.0))
     }
 
+    /// HyperCore perp account USDC (account value, withdrawable).
+    pub async fn hypercore_perp_usdc(&self, user: Address) -> Result<(f64, f64)> {
+        let v: Value = self
+            .http
+            .post("https://api.hyperliquid.xyz/info")
+            .json(&json!({"type": "clearinghouseState", "user": format!("{user:#x}")}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let f = |x: &Value| x.as_str().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        Ok((f(&v["marginSummary"]["accountValue"]), f(&v["withdrawable"])))
+    }
+
     pub async fn account_row(&self, user: Address) -> Result<AccountRow> {
         let v = self.get_value(&format!("/state/leaderboard/accounts/{user:#x}")).await?;
         let r = &v["selfRow"];
