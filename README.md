@@ -76,12 +76,18 @@ export PAPERBOT_TG_USERS=111,222         # user ids allowed to issue commands (u
 
 Put them (and the state/ledger paths) in `~/.paperbot/env` and `source` it — never in the repo.
 
-**Commands** (no trading commands, deliberately): `/status`, `/stats`, `/pair` (the open pair valued
-live off the Hyperliquid mid), `/rate`, `/cycles [n]`, `/params`, `/set <key> <value>`, `/pause`,
-`/resume`, `/help`. `/set` keys: `move` (%), `buffer` (%), `market` (auto|btc|eth), `capital` (0–1),
-`ddstop` (%), `ratefloor`, `maxcycles` (n|off); each change is validated (the buffer must clear the
-bust guard for the chosen move) and **applies from the next pair** — never under an open one.
-`/pause` stops new pairs while the open one finishes; `/resume` continues.
+**Commands** (allowlisted users only): `/status` (farm · pair · account · 24h · all-time · protocol ·
+session), `/pair` (live pnl per leg, net if closed, PAPER if closed, bust-guard distance, ETA to trigger),
+`/stats` (all-time, 24h, per market, pace, projection), `/rate` (curve + measured decay + half-life),
+`/cycles [n]`, `/health` (engine heartbeat, feed age, exchange gates, session key), `/params`,
+`/set <key> <value>`, `/pause`, `/resume`, `/liquidate`, `/help`.
+
+`/set` keys: `move` (%), `buffer` (%), `market` (auto|btc|eth), `capital` (0–1), `ddstop` (%),
+`ratefloor`, `maxcycles` (n|off); validated, applies from the next pair. `/pause` stops new pairs while
+the open one finishes. `/liquidate` shows what would be closed and issues a 60-second code; `/liquidate
+<code>` (same user) pauses the farm, lets a running engine close its own pair, and closes everything from
+the responder if no engine answers within 20 s. The engine also pushes alerts on its own: drawdown
+−25% / −50%, session key under 3 days, refusals, naked legs, stop reasons.
 
 All three surfaces share one file, `params.json` next to `state.json`: Telegram `/set` and the GUI's
 **apply** button write it, the engine re-reads it at the top of every cycle, and the GUI's strategy
