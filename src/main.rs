@@ -136,7 +136,8 @@ async fn main() -> Result<()> {
                 println!("no session registered — run `paperbot register`");
             }
         }
-        Cmd::Run(args) => {
+        Cmd::Run(ref args) => {
+            let args = args.clone();
             let mut eng = build_engine(api, st, &cli, domain, args)?;
             let row = eng.api.account_row(eng.user).await?;
             println!("user {:#x} · balance ${:.2} · queued ${:.2} · open positions {} · PAPER {:.0}",
