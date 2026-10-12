@@ -2,7 +2,7 @@
 
 use crate::api::{Api, TradingState};
 use crate::feed::Feed;
-use crate::notify::Notifier;
+use crate::notify::{dur as fdur, money as fmoney, paper as fpaper, Notifier};
 use crate::positions::Chain;
 use crate::sign::{self, Close, Intent, OpenPosition};
 use crate::state::{heartbeat_touch, ledger_append, InFlight, Params, State};
@@ -126,7 +126,7 @@ impl Engine {
     }
     fn stop_note(&self, why: &str) {
         tracing::info!(why, "stopping");
-        self.notify(format!("🛑 <b>farm stopped</b>: {why}"));
+        self.notify(format!("🛑 <b>Farm stopped</b> · {why}"));
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -134,7 +134,7 @@ impl Engine {
         if let Err(e) = &r {
             // awaited: the process usually exits right after this
             if let Some(n) = &self.notifier {
-                let _ = n.send_now(&format!("❌ <b>farm error</b>: {e}")).await;
+                let _ = n.send_now(&format!("❌ <b>Farm error</b>\n{e}")).await;
             }
         }
         // let fire-and-forget notifications (stop reason, last cycle) flush before the runtime goes away
@@ -192,9 +192,9 @@ impl Engine {
             dry_run = self.args.dry_run, "paperbot starting"
         );
         self.notify(format!(
-            "🧻 <b>UwU bot started</b>{}\nbalance ${:.2} · {}× · move {:.2}% · stop at −{:.0}% · market {}",
-            if self.args.dry_run { " (dry run)" } else { "" }, start_balance as f64 / E18, leverage, d * 100.0,
-            self.args.drawdown_stop_pct, self.args.market
+            "🧻 <b>UwU bot started</b>{}\n<code>equity       </code>{}\n<code>strategy     </code>{} · {:.2}% move · {}× · buffer {:.0}%\n<code>stop         </code>−{:.0}% from peak ({})",
+            if self.args.dry_run { " (dry run)" } else { "" }, fmoney(start_balance as f64 / E18), self.args.market, d * 100.0, leverage,
+            buf * 100.0, self.args.drawdown_stop_pct, fmoney(floor as f64 / E18)
         ));
 
         // crash recovery: a pair we opened and never closed
@@ -251,7 +251,7 @@ impl Engine {
                         leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
                         floor = (peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
                         tracing::info!(params = %p.summary(), "params updated");
-                        self.notify(format!("🔧 <b>params</b>: {}", p.summary()));
+                        self.notify(format!("🔧 <b>Params applied</b>\n{}", p.summary()));
                     }
                 }
             }
@@ -294,8 +294,8 @@ impl Engine {
             let balance = self.equity(&row);
             if balance > peak {
                 if balance as f64 > peak as f64 * 1.1 {
-                    self.notify(format!("💰 deposit detected: equity ${:.2} (was ${:.2}); drawdown stop now at ${:.2}",
-                        balance as f64 / E18, peak as f64 / E18, balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0) / E18));
+                    self.notify(format!("💰 <b>Deposit detected</b>\nequity {} (was {}) · drawdown stop now {}",
+                        fmoney(balance as f64 / E18), fmoney(peak as f64 / E18), fmoney(balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0) / E18)));
                 }
                 peak = balance;
                 floor = (peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
@@ -305,7 +305,7 @@ impl Engine {
             for (i, m) in [0.25, 0.5].iter().enumerate() {
                 if dd >= *m && !dd_alerted[i] {
                     dd_alerted[i] = true;
-                    self.notify(format!("📉 drawdown {:.0}%: balance ${:.2} from peak ${:.2}", dd * 100.0, balance as f64 / E18, peak as f64 / E18));
+                    self.notify(format!("📉 <b>Drawdown {:.0}%</b>\nequity {} from peak {} · stop at {}", dd * 100.0, fmoney(balance as f64 / E18), fmoney(peak as f64 / E18), fmoney(floor as f64 / E18)));
                 }
             }
             if balance <= floor {
@@ -541,11 +541,19 @@ impl Engine {
         }
         self.st.save(&self.state_path)?;
         tracing::info!(?ids, ?entries, gap_bps, "pair open");
-        self.notify(format!(
-            "🟢 <b>pair open</b> {} · {}× · ${:.0}/leg\nentries {:.1} / {:.1} · gap {:.1} bps · ids {}",
-            coin.name, leverage, margin_raw as f64 / E18, entries[0], entries[1], gap_bps,
-            ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
-        ));
+        {
+            let d = self.args.move_pct / 100.0;
+            let rate = self.api.summary().await.map(|s| s.mint_rate()).unwrap_or(0.0);
+            let n = margin_raw as f64 / E18 * leverage as f64;
+            let keep = keep_frac(d, coin.pos_mult);
+            self.notify(format!(
+                "🟢 <b>Pair open · {} · {}×</b>\n<code>margin       </code>{} per leg · {} per side\n<code>entries      </code>{:.1} / {:.1} · gap {:.1} bps\n<code>target       </code>{:.2}% · bust guard {:.3}%\n<code>at target    </code>~{} PAPER for {} (keeps {:.1}%)\n<code>ids          </code>{}",
+                coin.name, leverage, fmoney(margin_raw as f64 / E18), fmoney(n), entries[0], entries[1], gap_bps,
+                d * 100.0, (d * (1.0 + self.args.buffer_pct / 100.0) - BUST_BUFFER) * 100.0,
+                fpaper(rate * 0.98 * d * n), fmoney((1.0 - keep) * d * n), keep * 100.0,
+                ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+            ));
+        }
         if gap_bps > self.args.max_entry_gap_bps {
             tracing::warn!(gap_bps, "entry gap too wide; closing pair");
             self.notify(format!("⚠️ entry gap {gap_bps:.1} bps too wide, pair closed"));
@@ -755,12 +763,20 @@ impl Engine {
             tot_paper += v["paper_minted"].as_f64().unwrap_or(0.0);
             tot_spent -= v["pnl_usd"].as_f64().unwrap_or(0.0);
         }
-        self.notify(format!(
-            "✅ <b>cycle {}</b> {} · {:.3}% in {}m{:02}s\npnl ${:.2} · minted {:.0} PAPER · {}\ntotal {:.0} PAPER for ${:.2} → {:.0} PAPER/$ · rate {:.1}",
-            self.st.cycles_done + 1, pair.coin.name, mv * 100.0, pair.opened_at.elapsed().as_secs() / 60, pair.opened_at.elapsed().as_secs() % 60,
-            pnl as f64 / E18, minted as f64 / E18, trades.iter().map(|t| t.kind.as_str()).collect::<Vec<_>>().join("/"),
-            tot_paper, tot_spent, if tot_spent > 0.0 { tot_paper / tot_spent } else { 0.0 }, self.api.summary().await.map(|s| s.mint_rate()).unwrap_or(0.0)
-        ));
+        {
+            let rate = self.api.summary().await.map(|s| s.mint_rate()).unwrap_or(0.0);
+            let cost = -(pnl as f64 / E18);
+            let eff = if cost > 0.0 { minted as f64 / E18 / cost } else { 0.0 };
+            let theo = if rate > 0.0 { 0.98 * rate / (1.0 - keep_frac(mv.max(1e-6), pair.coin.pos_mult)) } else { 0.0 };
+            let liq = trades.iter().any(|t| t.kind == "Liquidated");
+            self.notify(format!(
+                "✅ <b>Cycle {} · {} · {:.3}% in {}</b>{}\n<code>result       </code>{} → <b>{} PAPER</b> ({:.0}/$ · model {:.0}/$)\n<code>all-time     </code>{} PAPER for {} → {:.0}/$\n<code>rate         </code>{:.2}/$",
+                self.st.cycles_done + 1, pair.coin.name, mv * 100.0, fdur(pair.opened_at.elapsed().as_secs()),
+                if liq { " ⚠️ liquidation" } else { "" },
+                fmoney(pnl as f64 / E18), fpaper(minted as f64 / E18), eff, theo,
+                fpaper(tot_paper), fmoney(tot_spent), if tot_spent > 0.0 { tot_paper / tot_spent } else { 0.0 }, rate
+            ));
+        }
         Ok(())
     }
 

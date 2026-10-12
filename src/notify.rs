@@ -38,6 +38,26 @@ impl Notifier {
         Ok(())
     }
 
+    pub async fn send_keyboard(&self, text: &str, buttons: &[(String, String)]) -> Result<()> {
+        let kb: Vec<Vec<serde_json::Value>> = buttons.iter().map(|(label, data)| vec![json!({"text": label, "callback_data": data})]).collect();
+        let r = self
+            .http
+            .post(format!("https://api.telegram.org/bot{}/sendMessage", self.token))
+            .json(&json!({ "chat_id": self.chat, "text": text, "parse_mode": "HTML", "disable_web_page_preview": true,
+                           "reply_markup": { "inline_keyboard": kb } }))
+            .send()
+            .await?;
+        if !r.status().is_success() {
+            anyhow::bail!("telegram {}: {}", r.status(), r.text().await.unwrap_or_default());
+        }
+        Ok(())
+    }
+
+    pub async fn answer_callback(&self, id: &str, text: &str) {
+        let _ = self.http.post(format!("https://api.telegram.org/bot{}/answerCallbackQuery", self.token))
+            .json(&json!({ "callback_query_id": id, "text": text })).send().await;
+    }
+
     /// Never blocks the caller; failures are logged, not raised.
     pub fn send(&self, text: String) {
         let me = self.clone();
@@ -70,35 +90,69 @@ pub struct Commander {
     feed: Option<Feed>,
     state_path: PathBuf,
     ledger_path: PathBuf,
-    /// Telegram user ids allowed to issue commands (PAPERBOT_TG_USERS, comma-separated). Empty = anyone in the chat.
     allow: Vec<String>,
-    /// pending /liquidate confirmation: (code, expires_at, requested_by)
     pending: Mutex<Option<(String, u64, String)>>,
+    started: std::time::Instant,
+    last_rec: Mutex<Option<String>>,
 }
 
 const COMMANDS: &[(&str, &str)] = &[
-    ("status", "one-screen overview: farm, pair, account, 24h, protocol"),
-    ("pair", "the open pair live: pnl per leg, net if closed, ETA to trigger"),
-    ("positions", "every open position, incl. ones the engine is not tracking"),
-    ("stats", "all-time and 24h performance, per market, pace"),
-    ("rate", "mint curve and measured decay"),
-    ("cycles", "last cycles (/cycles 10)"),
-    ("health", "engine heartbeat, feed, session key, responder"),
-    ("params", "live farm parameters"),
-    ("set", "/set move 0.4 | buffer 40 | market eth | capital 0.5 | ddstop 50 | ratefloor 8 | maxcycles 20|off"),
+    ("status", "overview: farm · pair · account · 24h · protocol"),
+    ("pair", "the open pair live: pnl, net if closed, progress, ETA"),
+    ("positions", "every open position, flags untracked ones"),
+    ("strategy", "BTC vs ETH: keep, cost, PAPER per $, vol, cycle time"),
+    ("calculate", "optimal move per market from live stats, with apply buttons"),
+    ("stats", "performance: all-time, 24h, per market, pace, supply share"),
+    ("rate", "mint curve, measured decay, half-life"),
+    ("cycles", "last cycles table (/cycles 10)"),
+    ("health", "engine heartbeat, feed, exchange gates, session key"),
+    ("params", "live parameters"),
+    ("set", "/set move 0.4 · buffer 40 · market eth · capital 0.5 · ddstop 50 · ratefloor 8 · maxcycles 20|off"),
     ("pause", "no new pairs; the open pair finishes"),
     ("resume", "continue opening pairs"),
-    ("liquidate", "close every open position and pause (asks for a code)"),
-    ("help", "command list"),
+    ("liquidate", "close everything and pause (asks for a code)"),
+    ("help", "this list"),
 ];
 
-fn money(v: f64) -> String {
-    if v < 0.0 { format!("-${:.2}", -v) } else { format!("${v:.2}") }
+// ---------- formatting ----------
+pub fn money(v: f64) -> String {
+    let neg = v < 0.0;
+    let a = v.abs();
+    let whole = a.trunc() as u64;
+    let cents = ((a - a.trunc()) * 100.0).round() as u64;
+    let (whole, cents) = if cents == 100 { (whole + 1, 0) } else { (whole, cents) };
+    format!("{}${}.{:02}", if neg { "−" } else { "" }, thousands(whole), cents)
 }
-fn dur(secs: u64) -> String {
+pub fn paper(v: f64) -> String {
+    thousands(v.max(0.0).round() as u64)
+}
+fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 { out.push(','); }
+        out.push(c);
+    }
+    out
+}
+pub fn dur(secs: u64) -> String {
     if secs >= 86_400 { format!("{}d {}h", secs / 86_400, (secs % 86_400) / 3600) }
     else if secs >= 3600 { format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60) }
     else { format!("{}m {:02}s", secs / 60, secs % 60) }
+}
+fn bar(frac: f64, width: usize) -> String {
+    let f = frac.clamp(0.0, 1.0);
+    let filled = (f * width as f64).round() as usize;
+    format!("{}{} {:>3.0}%", "▰".repeat(filled), "▱".repeat(width - filled), f * 100.0)
+}
+fn h(title: &str) -> String {
+    format!("<b>{title}</b>\n")
+}
+fn row(k: &str, v: impl AsRef<str>) -> String {
+    format!("<code>{:<13}</code>{}\n", k, v.as_ref())
+}
+fn signed(v: f64) -> String {
+    if v >= 0.0 { format!("+{}", money(v)) } else { money(v) }
 }
 
 impl Commander {
@@ -117,6 +171,8 @@ impl Commander {
             ledger_path,
             allow: std::env::var("PAPERBOT_TG_USERS").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
             pending: Mutex::new(None),
+            started: std::time::Instant::now(),
+            last_rec: Mutex::new(None),
         })
     }
 
@@ -126,15 +182,27 @@ impl Commander {
             let mut offset: i64 = 0;
             let mut conflicts = 0u32;
             let mut last_expiry_warning = 0u64;
+            let mut last_calc = 0u64;
             loop {
-                // periodic watch: session key expiry (once a day while under 3 days)
+                // every 15 minutes: recompute the optimum and post it if it moved materially
+                let now = crate::sign::now_secs();
+                if now.saturating_sub(last_calc) >= 900 {
+                    last_calc = now;
+                    if let Some((text, buttons, sig)) = self.calculate(true).await {
+                        let changed = self.last_rec.lock().unwrap().as_deref() != Some(sig.as_str());
+                        if changed {
+                            *self.last_rec.lock().unwrap() = Some(sig);
+                            let _ = self.n.send_keyboard(&text, &buttons).await;
+                        }
+                    }
+                }
                 if let Ok(st) = State::load(&self.state_path) {
                     if let Some(exp) = st.session_expiry {
                         let now = crate::sign::now_secs();
                         let left = exp.saturating_sub(now);
                         if left < 3 * 86_400 && now.saturating_sub(last_expiry_warning) > 86_400 {
                             last_expiry_warning = now;
-                            let _ = self.n.send_now(&format!("⚠️ session key expires in {} — re-register from the GUI", dur(left))).await;
+                            let _ = self.n.send_now(&format!("⚠️ <b>Session key expires in {}</b>\nRe-register from the GUI before it lapses.", dur(left))).await;
                         }
                     }
                 }
@@ -143,6 +211,20 @@ impl Commander {
                         conflicts = 0;
                         for u in updates {
                             offset = u["update_id"].as_i64().unwrap_or(offset - 1) + 1;
+                            if let Some(cq) = u.get("callback_query") {
+                                let from = cq["from"]["id"].as_i64().map(|i| i.to_string()).unwrap_or_default();
+                                let name = cq["from"]["first_name"].as_str().unwrap_or("someone").to_string();
+                                let id = cq["id"].as_str().unwrap_or("").to_string();
+                                if !self.allow.is_empty() && !self.allow.contains(&from) {
+                                    self.n.answer_callback(&id, "not allowed").await;
+                                    continue;
+                                }
+                                let data = cq["data"].as_str().unwrap_or("").to_string();
+                                let reply = self.apply_button(&data, &name).await;
+                                self.n.answer_callback(&id, "applied").await;
+                                let _ = self.n.send_now(&reply).await;
+                                continue;
+                            }
                             let m = &u["message"];
                             let chat = m["chat"]["id"].as_i64().map(|i| i.to_string()).unwrap_or_default();
                             let Some(text) = m["text"].as_str() else { continue };
@@ -156,6 +238,7 @@ impl Commander {
                             }
                             let name = m["from"]["first_name"].as_str().unwrap_or("someone").to_string();
                             let reply = self.handle(text, &from, &name).await;
+                            if reply.is_empty() { continue; }
                             if let Err(e) = self.n.send_now(&reply).await {
                                 tracing::warn!(error = %e, "telegram reply failed");
                             }
@@ -181,12 +264,7 @@ impl Commander {
 
     async fn set_commands(&self) -> Result<()> {
         let cmds: Vec<_> = COMMANDS.iter().map(|(c, d)| json!({"command": c, "description": d})).collect();
-        self.n
-            .http
-            .post(format!("https://api.telegram.org/bot{}/setMyCommands", self.n.token))
-            .json(&json!({ "commands": cmds }))
-            .send()
-            .await?;
+        self.n.http.post(format!("https://api.telegram.org/bot{}/setMyCommands", self.n.token)).json(&json!({ "commands": cmds })).send().await?;
         Ok(())
     }
 
@@ -194,7 +272,7 @@ impl Commander {
         let r = self
             .long
             .post(format!("https://api.telegram.org/bot{}/getUpdates", self.n.token))
-            .json(&json!({ "offset": offset, "timeout": 25, "allowed_updates": ["message"] }))
+            .json(&json!({ "offset": offset, "timeout": 25, "allowed_updates": ["message", "callback_query"] }))
             .send()
             .await?;
         if r.status().as_u16() == 409 {
@@ -217,46 +295,31 @@ impl Commander {
             "status" => self.status().await,
             "pair" => self.pair().await,
             "positions" | "position" => self.positions().await,
-            "stats" => self.stats(),
-            "rate" => self.rate().await,
-            "cycles" => self.cycles(arg.and_then(|a| a.parse().ok()).unwrap_or(5)),
-            "health" => self.health().await,
-            "params" => format!("🔧 <b>params</b>\n{}\nchanges apply from the next pair", self.params().summary()),
-            "set" => match (arg, arg2) {
-                (Some(k), Some(v)) => {
-                    let mut p = self.params();
-                    // a move that can't size a $10k-notional pair on the current balance is refused up front
-                    if let (Ok(st), Ok(ts)) = (State::load(&self.state_path), self.api.trading_state().await) {
-                        if let Some(u) = st.user {
-                            if let Ok(a) = self.api.account_row(u).await {
-                                let mut q = p.clone();
-                                if q.set(&k.to_lowercase(), v).is_ok() {
-                                    let per_leg = (a.balance_raw as f64 / 1e18 + st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0)) * q.capital_fraction / 2.0;
-                                    let lev = ((1.0 / (q.move_pct / 100.0 * (1.0 + q.buffer_pct / 100.0))).round()).clamp(1.0, 1000.0);
-                                    let min_notional = ts.min_open_notional_raw as f64 / 1e18;
-                                    if per_leg.floor() * lev < min_notional {
-                                        let max_move = 1.0 / ((min_notional / per_leg.floor()).ceil() * (1.0 + q.buffer_pct / 100.0)) * 100.0;
-                                        return format!("❌ {k} = {v} can't open a pair: ${:.0}/leg × {lev:.0}× = ${:.0} notional, minimum is ${min_notional:.0}\nwith this balance the move must be ≤ {max_move:.2}% at a {:.0}% buffer (or add funds)", per_leg.floor(), per_leg.floor() * lev, q.buffer_pct);
-                                    }
-                                }
-                            }
-                        }
+            "strategy" => self.strategy().await,
+            "calculate" | "calc" | "optimize" => match self.calculate(false).await {
+                Some((text, buttons, _)) => {
+                    if let Err(e) = self.n.send_keyboard(&text, &buttons).await {
+                        tracing::warn!(error = %e, "keyboard send failed");
+                        return text;
                     }
-                    match p.set(&k.to_lowercase(), v) {
-                        Ok(sum) => match p.save(&Params::path(&self.state_path)) {
-                            Ok(()) => format!("🔧 {name} set {k} = {v}\n{sum}\napplies from the next pair"),
-                            Err(e) => format!("could not save params: {e}"),
-                        },
-                        Err(e) => format!("❌ {e}"),
-                    }
+                    String::new()
                 }
-                _ => "usage: /set &lt;key&gt; &lt;value&gt; — keys: move buffer market capital ddstop ratefloor maxcycles".into(),
+                None => "not enough data yet (feed warming up or no account)".into(),
+            },
+            "stats" => self.stats().await,
+            "rate" => self.rate().await,
+            "cycles" => self.cycles(arg.and_then(|a| a.parse().ok()).unwrap_or(6)),
+            "health" => self.health().await,
+            "params" => format!("{}{}\n<i>changes apply from the next pair</i>", h("🔧 Parameters"), self.params_block(&self.params())),
+            "set" => match (arg, arg2) {
+                (Some(k), Some(v)) => self.set(k, v, name).await,
+                _ => format!("{}<code>/set key value</code>\nkeys: move · buffer · market · capital · ddstop · ratefloor · maxcycles", h("🔧 Usage")),
             },
             "pause" | "resume" => {
                 let mut p = self.params();
                 p.paused = cmd == "pause";
                 match p.save(&Params::path(&self.state_path)) {
-                    Ok(()) => if p.paused { format!("⏸ paused by {name} — the open pair (if any) finishes, no new pairs") } else { format!("▶️ resumed by {name}") },
+                    Ok(()) => if p.paused { format!("⏸ <b>Paused</b> by {name}\nThe open pair (if any) finishes; no new pairs until /resume.") } else { format!("▶️ <b>Resumed</b> by {name}") },
                     Err(e) => format!("could not save params: {e}"),
                 }
             }
@@ -266,7 +329,7 @@ impl Commander {
     }
 
     fn help(&self) -> String {
-        let mut s = String::from("🧻 <b>UwU bot</b>\n");
+        let mut s = h("🧻 UwU bot");
         for (c, d) in COMMANDS {
             s.push_str(&format!("/{c} — {d}\n"));
         }
@@ -278,6 +341,50 @@ impl Commander {
     }
     fn state(&self) -> State {
         State::load(&self.state_path).unwrap_or_default()
+    }
+    fn params_block(&self, p: &Params) -> String {
+        let d = p.move_pct / 100.0;
+        let lev = ((1.0 / (d * (1.0 + p.buffer_pct / 100.0))).round() as u32).clamp(1, 1000);
+        let mut s = String::new();
+        if p.paused { s.push_str("⏸ paused\n"); }
+        s.push_str(&row("market", &p.market));
+        s.push_str(&row("move", format!("{:.2}%  →  {lev}×, bust guard {:.3}%", p.move_pct, (d * (1.0 + p.buffer_pct / 100.0) - 0.0005) * 100.0)));
+        s.push_str(&row("buffer", format!("{:.0}%", p.buffer_pct)));
+        s.push_str(&row("capital", format!("×{:.2} of balance", p.capital_fraction)));
+        s.push_str(&row("dd stop", format!("−{:.0}% from peak", p.drawdown_stop_pct)));
+        s.push_str(&row("rate floor", format!("{:.1} PAPER/$", p.rate_floor)));
+        s.push_str(&row("max cycles", p.max_cycles.map(|m| m.to_string()).unwrap_or("off".into())));
+        s
+    }
+
+    async fn set(&self, k: &str, v: &str, name: &str) -> String {
+        let key = k.to_lowercase();
+        let mut p = self.params();
+        // refuse a move that cannot size a pair on the current balance
+        if let (Ok(st), Ok(ts)) = (State::load(&self.state_path), self.api.trading_state().await) {
+            if let Some(u) = st.user {
+                if let Ok(a) = self.api.account_row(u).await {
+                    let mut q = p.clone();
+                    if q.set(&key, v).is_ok() {
+                        let per_leg = ((a.balance_raw as f64 / 1e18 + st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0)) * q.capital_fraction / 2.0).floor();
+                        let lev = ((1.0 / (q.move_pct / 100.0 * (1.0 + q.buffer_pct / 100.0))).round()).clamp(1.0, 1000.0);
+                        let min_notional = ts.min_open_notional_raw as f64 / 1e18;
+                        if per_leg * lev < min_notional {
+                            let max_move = 1.0 / ((min_notional / per_leg).ceil() * (1.0 + q.buffer_pct / 100.0)) * 100.0;
+                            return format!("{}{} × {lev:.0}× = {} notional per leg, the minimum is {}.\nWith this balance the move must be ≤ {max_move:.2}% at a {:.0}% buffer — or add funds.",
+                                h("❌ Can't open a pair with that"), money(per_leg), money(per_leg * lev), money(min_notional), q.buffer_pct);
+                        }
+                    }
+                }
+            }
+        }
+        match p.set(&key, v) {
+            Ok(_) => match p.save(&Params::path(&self.state_path)) {
+                Ok(()) => format!("{}{}\n<i>set by {name} · applies from the next pair</i>", h(&format!("🔧 {key} → {v}")), self.params_block(&p)),
+                Err(e) => format!("could not save params: {e}"),
+            },
+            Err(e) => format!("❌ {e}"),
+        }
     }
 
     /// Live valuation of the open pair off the feed: (mid, long pnl, short pnl, net if closed, keep%, move)
@@ -298,69 +405,70 @@ impl Commander {
     }
 
     fn farm_line(&self, st: &State, p: &Params) -> String {
-        let hb = heartbeat_age(&self.state_path);
-        let engine = match hb {
+        let engine = match heartbeat_age(&self.state_path) {
             Some(a) if a <= 5 => "engine alive".to_string(),
-            Some(a) => format!("engine silent {}", dur(a)),
+            Some(a) => format!("engine silent for {}", dur(a)),
             None => "no engine running".to_string(),
         };
         let mode = if p.liquidate { "🛑 liquidating" } else if p.paused { "⏸ paused" } else if st.in_flight.is_some() { "▶️ in a cycle" } else { "▶️ running" };
         format!("{mode} · {engine}")
     }
 
+    fn totals(&self, rows: &[serde_json::Value]) -> (usize, f64, f64, f64) {
+        let paper: f64 = rows.iter().map(|r| r["paper_minted"].as_f64().unwrap_or(0.0)).sum::<f64>() + 0.0;
+        let spent: f64 = -rows.iter().map(|r| r["pnl_usd"].as_f64().unwrap_or(0.0)).sum::<f64>() + 0.0;
+        let secs: f64 = rows.iter().map(|r| r["elapsed_s"].as_f64().unwrap_or(0.0)).sum();
+        (rows.len(), paper, spent, secs)
+    }
+
     async fn status(&self) -> String {
         let st = self.state();
         let p = self.params();
-        let mut s = String::from("🧻 <b>UwU bot</b>\n");
-        s.push_str(&format!("farm: {}\n", self.farm_line(&st, &p)));
+        let mut s = h("🧻 UwU bot");
+        s.push_str(&row("farm", self.farm_line(&st, &p)));
         match st.in_flight.as_ref() {
             Some(f) => {
+                let target = if f.target_move > 0.0 { f.target_move } else { p.move_pct / 100.0 };
                 let age = dur(crate::sign::now_secs().saturating_sub(f.opened_at));
-                let target = if f.target_move > 0.0 { f.target_move * 100.0 } else { p.move_pct };
                 match self.pair_value(f) {
-                    Some((_, _, _, net, _, mv)) => s.push_str(&format!("pair: {} {}× · {age} · move {:.3}% of {:.2}% · net now {}\n", f.coin, f.leverage, mv * 100.0, target, money(net))),
-                    None => s.push_str(&format!("pair: {} {}× · {age}\n", f.coin, f.leverage)),
+                    Some((_, _, _, net, _, mv)) => {
+                        s.push_str(&row("pair", format!("{} {}× · {} · {age}", f.coin, f.leverage, money(f.margin_raw as f64 / 1e18 * 2.0))));
+                        s.push_str(&row("progress", format!("{}  {:.3}% of {:.2}%", bar(mv / target, 12), mv * 100.0, target * 100.0)));
+                        s.push_str(&row("net now", signed(net)));
+                    }
+                    None => s.push_str(&row("pair", format!("{} {}× · {age}", f.coin, f.leverage))),
                 }
             }
-            None => s.push_str("pair: none\n"),
+            None => s.push_str(&row("pair", "none")),
         }
         if let Some(u) = st.user {
             match self.api.account_row(u).await {
                 Ok(a) => {
                     let avail = a.balance_raw as f64 / 1e18;
                     let in_use = if a.open_positions > 0 { st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0) } else { 0.0 };
-                    s.push_str(&format!(
-                        "account: equity {} (available {} · in use {}) · queued {} · PAPER held {:.0}\n",
-                        money(avail + in_use), money(avail), money(in_use), money(a.queued_raw as f64 / 1e18), a.paper_raw as f64 / 1e18
-                    ))
+                    s.push_str(&row("equity", format!("{} (free {} · margin {})", money(avail + in_use + a.queued_raw as f64 / 1e18), money(avail), money(in_use))));
+                    if a.queued_raw > 0 { s.push_str(&row("queued", money(a.queued_raw as f64 / 1e18))); }
+                    s.push_str(&row("PAPER held", paper(a.paper_raw as f64 / 1e18)));
                 }
-                Err(e) => s.push_str(&format!("account: {e}\n")),
+                Err(e) => s.push_str(&row("account", format!("{e}"))),
             }
-            let spot = self.api.hypercore_spot_usdc(u).await.unwrap_or(0.0);
-            let (perp, _) = self.api.hypercore_perp_usdc(u).await.unwrap_or((0.0, 0.0));
-            s.push_str(&format!("wallet: HyperCore spot {} · perp {}\n", money(spot), money(perp)));
         } else {
-            s.push_str("account: no session registered\n");
+            s.push_str(&row("account", "no session registered"));
         }
         let rows = ledger_rows(&self.ledger_path);
         let now = crate::sign::now_secs() as f64;
-        let day: Vec<_> = rows.iter().filter(|r| r["ts"].as_f64().unwrap_or(0.0) >= now - 86_400.0).collect();
-        let sum = |rs: &[&serde_json::Value]| {
-            let paper: f64 = rs.iter().map(|r| r["paper_minted"].as_f64().unwrap_or(0.0)).sum();
-            let spent: f64 = -rs.iter().map(|r| r["pnl_usd"].as_f64().unwrap_or(0.0)).sum::<f64>() + 0.0;
-            (paper + 0.0, spent)
-        };
-        let (dp, ds) = sum(&day);
-        let all: Vec<_> = rows.iter().collect();
-        let (ap, asp) = sum(&all);
-        s.push_str(&format!("24h: {} cycles · {dp:.0} PAPER · {} spent\n", day.len(), money(ds)));
-        s.push_str(&format!("all-time: {} cycles · {ap:.0} PAPER · {} → {:.0} PAPER/$\n", rows.len(), money(asp), if asp > 0.0 { ap / asp } else { 0.0 }));
+        let day: Vec<_> = rows.iter().filter(|r| r["ts"].as_f64().unwrap_or(0.0) >= now - 86_400.0).cloned().collect();
+        let (dn, dp, ds, _) = self.totals(&day);
+        let (an, ap, asp, _) = self.totals(&rows);
+        s.push_str(&row("24h", format!("{dn} cycles · {} PAPER · {} spent", paper(dp), money(ds))));
+        s.push_str(&row("all-time", format!("{an} cycles · {} PAPER · {} → <b>{:.0}/$</b>", paper(ap), money(asp), if asp > 0.0 { ap / asp } else { 0.0 })));
         if let Ok(sum) = self.api.summary().await {
             let decay = self.api.decay_24h(&sum).await.map(|d| format!(" ({:+.1}%/day)", -d * 100.0)).unwrap_or_default();
-            s.push_str(&format!("protocol: rate {:.2}/${decay} · LP ${:.2}M · queue ${:.0}\n", sum.mint_rate(), sum.tracked_lp_usd / 1e6, sum.queue_usd));
+            s.push_str(&row("mint rate", format!("{:.2} PAPER/${decay}", sum.mint_rate())));
+            s.push_str(&row("protocol", format!("LP {} · queue {}", money(sum.tracked_lp_usd), money(sum.queue_usd))));
         }
         if let Some(exp) = st.session_expiry {
-            s.push_str(&format!("session key: {} left", dur(exp.saturating_sub(crate::sign::now_secs()))));
+            s.push_str(&row("session key", format!("{} left", dur(exp.saturating_sub(crate::sign::now_secs())))));
         }
         s
     }
@@ -368,35 +476,43 @@ impl Commander {
     async fn pair(&self) -> String {
         let st = self.state();
         let p = self.params();
-        let Some(f) = st.in_flight else { return "no pair open".into() };
+        let Some(f) = st.in_flight else { return format!("{}none", h("🟢 Pair")) };
         let Some((mid, lp, sp, net, kw, mv)) = self.pair_value(&f) else {
-            return format!("pair open on {} {}× but no live feed in this process", f.coin, f.leverage);
+            return format!("{}{} {}× open, but no live feed in this process", h("🟢 Pair"), f.coin, f.leverage);
         };
         let d = if f.target_move > 0.0 { f.target_move } else { p.move_pct / 100.0 };
         let bust_guard = d * (1.0 + p.buffer_pct / 100.0) - 0.0005;
         let rate = self.api.summary().await.map(|s| s.mint_rate()).unwrap_or(0.0);
+        let n = f.margin_raw as f64 / 1e18 * f.leverage as f64;
         let elapsed = crate::sign::now_secs().saturating_sub(f.opened_at);
+        let (l, _w) = (lp.min(sp), lp.max(sp));
         let eta = self.feed.as_ref().and_then(|fd| fd.daily_vol(&f.coin)).map(|v| {
             let remaining = (d - mv).max(0.0);
-            let days = (remaining / v).powi(2);
-            format!(" · ETA ~{}", dur((days * 86_400.0) as u64))
-        }).unwrap_or_default();
-        let (l, _w) = (lp.min(sp), lp.max(sp));
-        format!(
-            "🟢 <b>{} pair</b> {}× · ${:.0}/leg · open {}\nentries {:.1} / {:.1} → mid {:.1}\nmove {:.3}% of {:.2}% (bust guard {:.3}%){eta}\nlong {} · short {}\nnet if closed now <b>{}</b> (winner keeps {:.1}%)\nPAPER if closed now <b>{:.0}</b> @ {:.1}/$\nids {}",
-            f.coin, f.leverage, f.margin_raw as f64 / 1e18, dur(elapsed),
-            f.entries.first().copied().unwrap_or(f.mid_at_open), f.entries.get(1).copied().unwrap_or(f.mid_at_open), mid,
-            mv * 100.0, d * 100.0, bust_guard * 100.0,
-            money(lp), money(sp), money(net), kw * 100.0, rate * 0.98 * (-l).max(0.0), rate,
-            f.position_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
-        )
+            dur(((remaining / v).powi(2) * 86_400.0) as u64)
+        });
+        let keep_at_target = keep_frac(d, if f.coin == "ETH" { 483.979 } else { 814.598 });
+        let mut s = h(&format!("🟢 {} pair · {}× · {} per leg", f.coin, f.leverage, money(f.margin_raw as f64 / 1e18)));
+        s.push_str(&row("notional", format!("{} per side", money(n))));
+        s.push_str(&row("entry → mid", format!("{:.1} → {:.1}", f.mid_at_open, mid)));
+        s.push_str(&row("progress", format!("{}  {:.3}% of {:.2}%", bar(mv / d, 12), mv * 100.0, d * 100.0)));
+        s.push_str(&row("bust guard", format!("{:.3}% ({:.3}% away)", bust_guard * 100.0, (bust_guard - mv).max(0.0) * 100.0)));
+        if let Some(e) = eta { s.push_str(&row("ETA", format!("~{e} (realised vol)"))); }
+        s.push_str(&row("open for", dur(elapsed)));
+        s.push_str("\n");
+        s.push_str(&row("long", signed(lp)));
+        s.push_str(&row("short", signed(sp)));
+        s.push_str(&row("net now", format!("<b>{}</b> (winner keeps {:.1}%)", signed(net), kw * 100.0)));
+        s.push_str(&row("PAPER now", format!("<b>{}</b> @ {:.1}/$", paper(rate * 0.98 * (-l).max(0.0)), rate)));
+        s.push_str(&row("at target", format!("{} PAPER for {} (keeps {:.1}%)", paper(rate * 0.98 * d * n), money((1.0 - keep_at_target) * d * n), keep_at_target * 100.0)));
+        s.push_str(&row("ids", f.position_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")));
+        s
     }
 
     async fn positions(&self) -> String {
         let st = self.state();
         let Some(user) = st.user else { return "no session registered".into() };
         let count = match self.api.account_row(user).await { Ok(a) => a.open_positions, Err(e) => return format!("account: {e}") };
-        let mut s = format!("📂 <b>open positions: {count}</b>\n");
+        let mut s = h(&format!("📂 Open positions: {count}"));
         if count == 0 {
             return s + "none";
         }
@@ -404,57 +520,143 @@ impl Commander {
         if let Some(f) = st.in_flight.as_ref() {
             let mid = self.feed.as_ref().and_then(|fd| fd.mid(&f.coin)).map(|m| m.px);
             let n = f.margin_raw as f64 / 1e18 * f.leverage as f64;
+            s.push_str("<code>id      side  lev   margin    notional   entry      pnl</code>\n");
             for (i, id) in f.position_ids.iter().enumerate() {
                 let long = f.longs.get(i).copied().unwrap_or(i == 0);
                 let entry = f.entries.get(i).copied().unwrap_or(f.mid_at_open);
                 let pnl = mid.map(|m| (m / entry - 1.0) * n * if long { 1.0 } else { -1.0 });
                 s.push_str(&format!(
-                    "#{id} {} {} {}× · ${:.0} margin · ${:.0} notional · entry {:.2}{}\n",
-                    f.coin, if long { "LONG " } else { "SHORT" }, f.leverage, f.margin_raw as f64 / 1e18, n, entry,
-                    pnl.map(|p| format!(" · pnl {}", money(p))).unwrap_or_default()
+                    "<code>{:<7} {:<5} {:>4}× {:>8} {:>10} {:>9.1} {:>8}</code>\n",
+                    id, if long { "LONG" } else { "SHORT" }, f.leverage, money(f.margin_raw as f64 / 1e18), money(n), entry,
+                    pnl.map(signed).unwrap_or("—".into())
                 ));
             }
-            s.push_str(&format!("tracked by the engine · open {}\n", dur(crate::sign::now_secs().saturating_sub(f.opened_at))));
+            s.push_str(&format!("{} · tracked by the engine · open {}\n", f.coin, dur(crate::sign::now_secs().saturating_sub(f.opened_at))));
         }
         if count > tracked {
-            s.push_str(&format!("⚠️ {} position(s) NOT tracked by the engine — a running engine adopts them on its next loop; /liquidate closes everything\n", count - tracked));
+            s.push_str(&format!("\n⚠️ <b>{} position(s) not tracked by the engine.</b> A running engine adopts them on its next loop; /liquidate closes everything.", count - tracked));
         }
         s
     }
 
-    fn stats(&self) -> String {
+    async fn strategy(&self) -> String {
+        let p = self.params();
+        let d = p.move_pct / 100.0;
+        let lev = ((1.0 / (d * (1.0 + p.buffer_pct / 100.0))).round() as u32).clamp(1, 1000);
+        let rate = self.api.summary().await.map(|s| s.mint_rate()).unwrap_or(0.0);
+        let mut s = h(&format!("🎯 Strategy · {} · {:.2}% move · {}×", p.market, p.move_pct, lev));
+        s.push_str(&row("bust guard", format!("{:.3}% · close at {:.2}%", (d * (1.0 + p.buffer_pct / 100.0) - 0.0005) * 100.0, p.move_pct)));
+        s.push_str(&row("mint rate", format!("{rate:.2} PAPER/$")));
+        s.push_str("\n<code>              BTC        ETH</code>\n");
+        let (kb, ke) = (keep_frac(d, 814.598), keep_frac(d, 483.979));
+        let vol = |c: &str| self.feed.as_ref().and_then(|f| f.daily_vol(c));
+        let (vb, ve) = (vol("BTC"), vol("ETH"));
+        let cyc = |v: Option<f64>| v.map(|v| (v / d).powi(2)).map(|c| format!("{c:>8.1}/d")).unwrap_or("   —     ".into());
+        let eta = |v: Option<f64>| v.map(|v| dur(((d / v).powi(2) * 86_400.0) as u64)).map(|e| format!("{e:>9}")).unwrap_or("   —     ".into());
+        s.push_str(&format!("<code>{:<12}{:>8.1}%  {:>8.1}%</code>\n", "keeps", kb * 100.0, ke * 100.0));
+        s.push_str(&format!("<code>{:<12}{:>8.1}%  {:>8.1}%</code>\n", "cost/cycle", (1.0 - kb) * 100.0, (1.0 - ke) * 100.0));
+        s.push_str(&format!("<code>{:<12}{:>9.0}  {:>9.0}</code>\n", "PAPER / $", if rate > 0.0 { 0.98 * rate / (1.0 - kb) } else { 0.0 }, if rate > 0.0 { 0.98 * rate / (1.0 - ke) } else { 0.0 }));
+        s.push_str(&format!("<code>{:<12}{}  {}</code>\n", "vol (real.)", vb.map(|v| format!("{:>8.2}%", v * 100.0)).unwrap_or("   —     ".into()), ve.map(|v| format!("{:>8.2}%", v * 100.0)).unwrap_or("   —     ".into())));
+        s.push_str(&format!("<code>{:<12}{}  {}</code>\n", "cycles", cyc(vb), cyc(ve)));
+        s.push_str(&format!("<code>{:<12}{}  {}</code>\n", "cycle time", eta(vb), eta(ve)));
+        s.push_str("\n<i>BTC is the cheaper cycle, ETH the faster one; auto prices both against the remaining capital and time every cycle.</i>");
+        s
+    }
+
+    /// (text, buttons, signature). `quiet` = scheduled run.
+    pub async fn calculate(&self, quiet: bool) -> Option<(String, Vec<(String, String)>, String)> {
+        use crate::optimizer::{optimize, Inputs};
+        let st = self.state();
+        let p = self.params();
+        let user = st.user?;
+        let (a, sum, ts) = (self.api.account_row(user).await.ok()?, self.api.summary().await.ok()?, self.api.trading_state().await.ok()?);
+        let equity = a.balance_raw as f64 / 1e18 + if a.open_positions > 0 { st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0) } else { 0.0 } + a.queued_raw as f64 / 1e18;
+        let decay = self.api.decay_24h(&sum).await.unwrap_or(0.15).clamp(0.0, 0.8);
+        let feed = self.feed.as_ref()?;
+        let vols: Vec<(&'static str, f64)> = [("BTC", 0.024), ("ETH", 0.031)].iter().map(|(c, fb)| (*c, feed.daily_vol(c).unwrap_or(*fb))).collect();
+        let sampled = ["BTC", "ETH"].iter().all(|c| feed.daily_vol(c).is_some());
+        let inp = Inputs {
+            equity_usd: equity, capital_fraction: p.capital_fraction, dd_stop: p.drawdown_stop_pct / 100.0,
+            rate: sum.mint_rate(), decay_per_day: decay,
+            min_notional: ts.min_open_notional_raw as f64 / 1e18,
+            max_notional: ts.instruments.iter().map(|i| i.max_notional_raw as f64 / 1e18).fold(10e6, f64::min),
+            horizon_days: 7.0, max_cycles_per_day: 300.0,
+        };
+        let recs = optimize(&vols, &inp);
+        if recs.is_empty() {
+            return Some((format!("{}no valid configuration: equity {} can't reach the {} minimum notional", h("🧮 Optimizer"), money(equity), money(inp.min_notional)), vec![], "none".into()));
+        }
+        let mut s = h(&format!("🧮 Optimizer · 7-day horizon{}", if quiet { " · 15-min check" } else { "" }));
+        s.push_str(&row("inputs", format!("equity {} · rate {:.2}/$ · decay {:.0}%/day · vol BTC {:.2}% ETH {:.2}%{}",
+            money(equity), sum.mint_rate(), decay * 100.0, vols[0].1 * 100.0, vols[1].1 * 100.0, if sampled { "" } else { " (defaults)" })));
+        s.push_str("<code>       move   buf   lev  cyc/d  cost  PAPER/$ PAPER/day</code>\n");
+        let mut buttons = Vec::new();
+        for r in &recs {
+            s.push_str(&format!("<code>{:<4} {:>5.2}% {:>4.0}% {:>4}× {:>5.1} {:>5.1}% {:>7.0} {:>9}</code>\n",
+                r.coin, r.move_pct, r.buffer_pct, r.leverage, r.cycles_per_day, r.cost_pct, r.paper_per_usd, paper(r.paper_per_day)));
+            buttons.push((format!("Apply {} · {:.2}% / {:.0}% ({}×)", r.coin, r.move_pct, r.buffer_pct, r.leverage),
+                          format!("apply:{}:{:.2}:{:.0}", r.coin.to_lowercase(), r.move_pct, r.buffer_pct)));
+        }
+        let best = &recs[0];
+        s.push_str(&format!("\n<b>{}</b> wins over 7 days: ~{} PAPER for {} in {:.1} days of farming\n", best.coin, paper(best.paper_total), money(best.paper_total / best.paper_per_usd.max(1e-9)), best.days_used));
+        s.push_str(&format!("<i>current: {} · {:.2}% / {:.0}%</i>", p.market, p.move_pct, p.buffer_pct));
+        buttons.push((format!("Apply AUTO · {:.2}% / {:.0}%", best.move_pct, best.buffer_pct), format!("apply:auto:{:.2}:{:.0}", best.move_pct, best.buffer_pct)));
+        let sig = recs.iter().map(|r| format!("{}:{:.1}", r.coin, (r.move_pct * 5.0).round() / 5.0)).collect::<Vec<_>>().join("|");
+        Some((s, buttons, sig))
+    }
+
+    async fn apply_button(&self, data: &str, name: &str) -> String {
+        let parts: Vec<&str> = data.split(':').collect();
+        if parts.len() != 4 || parts[0] != "apply" {
+            return "unknown button".into();
+        }
+        let mut p = self.params();
+        for (k, v) in [("market", parts[1]), ("move", parts[2]), ("buffer", parts[3])] {
+            if let Err(e) = p.set(k, v) {
+                return format!("❌ {e}");
+            }
+        }
+        match p.save(&Params::path(&self.state_path)) {
+            Ok(()) => format!("{}{}\n<i>applied by {name} · from the next pair</i>", h("🔧 Optimizer params applied"), self.params_block(&p)),
+            Err(e) => format!("could not save params: {e}"),
+        }
+    }
+
+    async fn stats(&self) -> String {
         let rows = ledger_rows(&self.ledger_path);
         if rows.is_empty() {
-            return "no cycles in the ledger yet".into();
+            return format!("{}no cycles in the ledger yet", h("📊 Performance"));
         }
-        let agg = |rs: &[&serde_json::Value]| -> (usize, f64, f64, f64) {
-            let paper: f64 = rs.iter().map(|r| r["paper_minted"].as_f64().unwrap_or(0.0)).sum();
-            let spent: f64 = -rs.iter().map(|r| r["pnl_usd"].as_f64().unwrap_or(0.0)).sum::<f64>() + 0.0;
-            let secs: f64 = rs.iter().map(|r| r["elapsed_s"].as_f64().unwrap_or(0.0)).sum();
-            (rs.len(), paper, spent, secs)
-        };
-        let all: Vec<_> = rows.iter().collect();
-        let (n, paper, spent, secs) = agg(&all);
+        let (n, pap, spent, secs) = self.totals(&rows);
         let now = crate::sign::now_secs() as f64;
-        let day: Vec<_> = rows.iter().filter(|r| r["ts"].as_f64().unwrap_or(0.0) >= now - 86_400.0).collect();
-        let (dn, dpaper, dspent, _) = agg(&day);
+        let day: Vec<_> = rows.iter().filter(|r| r["ts"].as_f64().unwrap_or(0.0) >= now - 86_400.0).cloned().collect();
+        let (dn, dp, ds, _) = self.totals(&day);
         let first = rows.first().and_then(|r| r["ts"].as_f64()).unwrap_or(now);
         let hours = ((now - first) / 3600.0).max(1.0 / 60.0);
-        let mut s = format!(
-            "📊 <b>farm stats</b>\nall-time: {n} cycles · {paper:.0} PAPER · {} spent → <b>{:.0} PAPER/$</b>\n24h: {dn} cycles · {dpaper:.0} PAPER · {} → {:.0} PAPER/$\npace: {:.0} PAPER/h over {:.1}h · ~{:.0}/day · avg cycle {}\n",
-            money(spent), if spent > 0.0 { paper / spent } else { 0.0 },
-            money(dspent), if dspent > 0.0 { dpaper / dspent } else { 0.0 },
-            paper / hours, hours, paper / hours * 24.0, dur((secs / n as f64) as u64)
-        );
+        let eff = if spent > 0.0 { pap / spent } else { 0.0 };
+        let mut s = h("📊 Performance");
+        s.push_str(&row("all-time", format!("{n} cycles · <b>{}</b> PAPER · {} spent", paper(pap), money(spent))));
+        s.push_str(&row("efficiency", format!("<b>{eff:.0} PAPER/$</b> · {} per 1k PAPER", money(if pap > 0.0 { spent / pap * 1000.0 } else { 0.0 }))));
+        s.push_str(&row("24h", format!("{dn} cycles · {} PAPER · {} → {:.0}/$", paper(dp), money(ds), if ds > 0.0 { dp / ds } else { 0.0 })));
+        s.push_str(&row("pace", format!("{} PAPER/h · ~{}/day · avg cycle {}", paper(pap / hours), paper(pap / hours * 24.0), dur((secs / n as f64) as u64))));
         for coin in ["BTC", "ETH"] {
-            let rs: Vec<_> = rows.iter().filter(|r| r["coin"] == coin).collect();
+            let rs: Vec<_> = rows.iter().filter(|r| r["coin"] == coin).cloned().collect();
             if rs.is_empty() { continue; }
-            let (cn, cp, cs, csec) = agg(&rs);
-            s.push_str(&format!("{coin}: {cn} cycles · {cp:.0} PAPER · {} → {:.0}/$ · avg {}\n", money(cs), if cs > 0.0 { cp / cs } else { 0.0 }, dur((csec / cn as f64) as u64)));
+            let (cn, cp, cs, csec) = self.totals(&rs);
+            s.push_str(&row(coin, format!("{cn} cycles · {} PAPER · {} → {:.0}/$ · avg {}", paper(cp), money(cs), if cs > 0.0 { cp / cs } else { 0.0 }, dur((csec / cn as f64) as u64))));
         }
         let worst = rows.iter().map(|r| r["pnl_usd"].as_f64().unwrap_or(0.0)).fold(f64::MAX, f64::min);
         let best = rows.iter().map(|r| r["pnl_usd"].as_f64().unwrap_or(0.0)).fold(f64::MIN, f64::max);
-        s.push_str(&format!("best / worst cycle {} / {}", money(best), money(worst)));
+        s.push_str(&row("best / worst", format!("{} / {}", signed(best), signed(worst))));
+        if let Ok(sum) = self.api.summary().await {
+            let st = self.state();
+            let held = if let Some(u) = st.user { self.api.account_row(u).await.map(|a| a.paper_raw as f64 / 1e18).unwrap_or(pap) } else { pap };
+            let share = held / sum.supply.max(1.0);
+            s.push_str("\n");
+            s.push_str(&row("PAPER held", format!("{} · {:.4}% of {:.2}B supply", paper(held), share * 100.0, sum.supply / 1e9)));
+            let theo = 0.98 * sum.mint_rate() / (1.0 - keep_frac(self.params().move_pct / 100.0, 814.598));
+            s.push_str(&row("vs model", format!("{:.0} PAPER/$ at today's rate and move (BTC)", theo)));
+        }
         s
     }
 
@@ -462,15 +664,17 @@ impl Commander {
         match self.api.summary().await {
             Ok(s) => {
                 let decay = self.api.decay_24h(&s).await.ok();
-                let half = decay.filter(|d| *d > 0.0).map(|d| format!("\nat that pace the rate halves in {:.1} days", (0.5f64).ln() / (1.0 - d).ln()));
-                format!(
-                    "📈 <b>mint curve</b>\nrate <b>{:.2}</b> PAPER per $1 loss{}{}\ntail HWM ${:.2}M · tracked LP ${:.2}M · queue ${:.0}\nsupply {:.3}B of 12B\neach +$1M of LP gain → −{:.2}% rate",
-                    s.mint_rate(),
-                    decay.map(|d| format!(" · measured {:+.1}%/day", -d * 100.0)).unwrap_or_default(),
-                    half.unwrap_or_default(),
-                    s.tail_progress_usd / 1e6, s.tracked_lp_usd / 1e6, s.queue_usd, s.supply / 1e9,
-                    2e6 / (120e6 + s.tail_progress_usd) * 100.0
-                )
+                let mut o = h("📈 Mint curve");
+                o.push_str(&row("rate", format!("<b>{:.2}</b> PAPER per $1 of loss", s.mint_rate())));
+                if let Some(d) = decay {
+                    o.push_str(&row("decay", format!("{:+.1}%/day measured", -d * 100.0)));
+                    if d > 0.0 { o.push_str(&row("half-life", format!("{:.1} days at this pace", (0.5f64).ln() / (1.0 - d).ln()))); }
+                }
+                o.push_str(&row("tail HWM", money(s.tail_progress_usd)));
+                o.push_str(&row("tracked LP", format!("{} · queue {}", money(s.tracked_lp_usd), money(s.queue_usd))));
+                o.push_str(&row("supply", format!("{:.3}B of 12B cap ({:.1}%)", s.supply / 1e9, s.supply / 12e9 * 100.0)));
+                o.push_str(&row("sensitivity", format!("−{:.2}% rate per +$1M of LP gain", 2e6 / (120e6 + s.tail_progress_usd) * 100.0)));
+                o
             }
             Err(e) => format!("summary failed: {e}"),
         }
@@ -479,40 +683,44 @@ impl Commander {
     fn cycles(&self, n: usize) -> String {
         let rows = ledger_rows(&self.ledger_path);
         if rows.is_empty() {
-            return "no cycles yet".into();
+            return format!("{}none yet", h("🧾 Cycles"));
         }
-        let mut s = format!("🧾 <b>last {} cycles</b>\n<code>", n.min(rows.len()));
+        let mut s = h(&format!("🧾 Last {} cycles", n.min(rows.len())));
+        s.push_str("<code>  #  coin  lev   move    time      pnl    PAPER   /$</code>\n");
         for r in rows.iter().rev().take(n.clamp(1, 30)) {
+            let pnl = r["pnl_usd"].as_f64().unwrap_or(0.0);
+            let pm = r["paper_minted"].as_f64().unwrap_or(0.0);
             s.push_str(&format!(
-                "#{:<3} {:<3} {:>4}x {:>6.3}% {:>5} {:>+8.2} {:>8.0}\n",
+                "<code>{:>3}  {:<4} {:>4}× {:>6.3}% {:>7} {:>8} {:>8} {:>4.0}</code>\n",
                 r["cycle"].as_u64().unwrap_or(0), r["coin"].as_str().unwrap_or("?"), r["leverage"].as_u64().unwrap_or(0),
                 r["move"].as_f64().unwrap_or(0.0) * 100.0, dur(r["elapsed_s"].as_u64().unwrap_or(0)),
-                r["pnl_usd"].as_f64().unwrap_or(0.0), r["paper_minted"].as_f64().unwrap_or(0.0)
+                signed(pnl), paper(pm), if pnl < 0.0 { pm / -pnl } else { 0.0 }
             ));
         }
-        s.push_str("</code>#  coin lev move time pnl PAPER");
         s
     }
 
     async fn health(&self) -> String {
         let st = self.state();
         let p = self.params();
-        let mut s = String::from("🩺 <b>health</b>\n");
-        s.push_str(&format!("farm: {}\n", self.farm_line(&st, &p)));
+        let mut s = h("🩺 Health");
+        s.push_str(&row("farm", self.farm_line(&st, &p)));
         for coin in ["BTC", "ETH"] {
             match self.feed.as_ref().and_then(|f| f.mid(coin)) {
-                Some(m) => s.push_str(&format!("feed {coin}: {:.1} ({:.1}s ago)\n", m.px, m.age().as_secs_f64())),
-                None => s.push_str(&format!("feed {coin}: none\n")),
+                Some(m) => s.push_str(&row(&format!("feed {coin}"), format!("{:.1} · {:.1}s ago", m.px, m.age().as_secs_f64()))),
+                None => s.push_str(&row(&format!("feed {coin}"), "none")),
             }
         }
         match self.api.trading_state().await {
-            Ok(ts) => s.push_str(&format!("exchange: tradingPaused={} · opens gated={} · closes gated={}\n", ts.trading_paused, ts.action_paused("openPosition"), ts.action_paused("closePositions"))),
-            Err(e) => s.push_str(&format!("exchange: {e}\n")),
+            Ok(ts) => s.push_str(&row("exchange", format!("trading {} · opens {} · closes {}",
+                if ts.trading_paused { "PAUSED" } else { "live" }, if ts.action_paused("openPosition") { "gated" } else { "ok" }, if ts.action_paused("closePositions") { "gated" } else { "ok" }))),
+            Err(e) => s.push_str(&row("exchange", format!("{e}"))),
         }
         if let Some(exp) = st.session_expiry {
-            s.push_str(&format!("session key: {} left\n", dur(exp.saturating_sub(crate::sign::now_secs()))));
+            s.push_str(&row("session key", format!("{} left", dur(exp.saturating_sub(crate::sign::now_secs())))));
         }
-        s.push_str(&format!("state: {} · cycles done {}", self.state_path.display(), st.cycles_done));
+        s.push_str(&row("responder", format!("up {}", dur(self.started.elapsed().as_secs()))));
+        s.push_str(&row("state", format!("{} · {} cycles done", self.state_path.display(), st.cycles_done)));
         s
     }
 
@@ -525,16 +733,16 @@ impl Commander {
                 let code = format!("{:04}", rand::random::<u16>() % 10_000);
                 let exp = crate::sign::now_secs() + 60;
                 *self.pending.lock().unwrap() = Some((code.clone(), exp, from.to_string()));
-                let mut s = format!("🛑 <b>liquidate?</b> requested by {name}\n");
-                s.push_str(&format!("open positions: {open}\n"));
+                let mut s = h(&format!("🛑 Liquidate? · requested by {name}"));
+                s.push_str(&row("open", format!("{open} position(s)")));
                 if let Some(f) = st.in_flight.as_ref() {
-                    match self.pair_value(f) {
-                        Some((mid, lp, sp, net, _, _)) => s.push_str(&format!("{} {}× · mid {:.1} · long {} · short {} · net if closed {}\n", f.coin, f.leverage, mid, money(lp), money(sp), money(net))),
-                        None => s.push_str(&format!("{} {}×\n", f.coin, f.leverage)),
+                    if let Some((mid, lp, sp, net, _, _)) = self.pair_value(f) {
+                        s.push_str(&row("pair", format!("{} {}× · mid {:.1}", f.coin, f.leverage, mid)));
+                        s.push_str(&row("if closed", format!("long {} · short {} · net <b>{}</b>", signed(lp), signed(sp), signed(net))));
                     }
                 }
-                s.push_str("this closes everything and pauses the farm.\n");
-                s.push_str(&format!("confirm within 60s: <code>/liquidate {code}</code>"));
+                s.push_str("\nThis closes everything and pauses the farm.\n");
+                s.push_str(&format!("Confirm within 60s: <code>/liquidate {code}</code>"));
                 s
             }
             Some(c) => {
@@ -542,13 +750,12 @@ impl Commander {
                     let mut g = self.pending.lock().unwrap();
                     match g.take() {
                         Some((code, exp, by)) if code == c && crate::sign::now_secs() <= exp && by == from => true,
-                        Some(_) | None => false,
+                        _ => false,
                     }
                 };
                 if !ok {
-                    return "no valid confirmation — send /liquidate first, then the code within 60s (same user)".into();
+                    return "No valid confirmation — send /liquidate first, then the code within 60s from the same account.".into();
                 }
-                // 1. pause + flag: a running engine closes its own pair and clears the flag
                 let pp = Params::path(&self.state_path);
                 let mut p = self.params();
                 p.paused = true;
@@ -556,7 +763,7 @@ impl Commander {
                 if let Err(e) = p.save(&pp) {
                     return format!("could not write params: {e}");
                 }
-                let _ = self.n.send_now(&format!("🛑 liquidate confirmed by {name} — pausing and closing…")).await;
+                let _ = self.n.send_now(&format!("🛑 <b>Liquidate confirmed</b> by {name} — pausing and closing…")).await;
                 let engine_alive = heartbeat_age(&self.state_path).map(|a| a <= 5).unwrap_or(false);
                 if engine_alive && open > 0 {
                     for _ in 0..20 {
@@ -567,16 +774,12 @@ impl Commander {
                     }
                 }
                 let still_open = self.api.account_row(user).await.map(|a| a.open_positions).unwrap_or(open);
-                // 2. nothing (or no engine) closed them: do it from here
                 let note: String;
                 if still_open > 0 {
                     let (_tx, rx) = tokio::sync::watch::channel(false);
                     match (Chain::new(&crate::positions::rpc_url()), self.feed.clone()) {
                         (Ok(chain), Some(feed)) => match Engine::new(self.api.clone(), chain, feed, self.state(), RunArgs::parse_from(["run"]), self.state_path.clone(), self.ledger_path.clone(), rx) {
-                            Ok(mut eng) => { note = match eng.close_all().await {
-                                Ok(()) => "closed from the responder".into(),
-                                Err(e) => format!("close-all failed: {e}"),
-                            } }
+                            Ok(mut eng) => { note = match eng.close_all().await { Ok(()) => "closed from the responder".into(), Err(e) => format!("close-all failed: {e}") } }
                             Err(e) => note = format!("engine: {e}"),
                         },
                         _ => note = "no feed/rpc in this process".into(),
@@ -590,11 +793,11 @@ impl Commander {
                     let _ = p.save(&pp);
                 }
                 let after = self.api.account_row(user).await.ok();
-                format!(
-                    "🛑 <b>liquidated</b> — {note}\nopen positions now: {} · balance {}\nfarm is paused; /resume to continue",
-                    after.as_ref().map(|a| a.open_positions.to_string()).unwrap_or("?".into()),
-                    after.map(|a| money(a.balance_raw as f64 / 1e18)).unwrap_or("?".into())
-                )
+                let mut s = h(&format!("🛑 Liquidated · {note}"));
+                s.push_str(&row("open now", after.as_ref().map(|a| a.open_positions.to_string()).unwrap_or("?".into())));
+                s.push_str(&row("balance", after.map(|a| money(a.balance_raw as f64 / 1e18)).unwrap_or("?".into())));
+                s.push_str("Farm is paused — /resume to continue.");
+                s
             }
         }
     }

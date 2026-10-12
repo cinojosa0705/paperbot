@@ -2,6 +2,7 @@ pub mod api;
 pub mod engine;
 pub mod feed;
 pub mod notify;
+pub mod optimizer;
 pub mod positions;
 pub mod session;
 pub mod sign;

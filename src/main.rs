@@ -134,7 +134,11 @@ async fn main() -> Result<()> {
             std::env::set_var("PAPERBOT_TG_CHAT", std::env::var("PAPERBOT_TG_CHAT").unwrap_or("0".into()));
             let c = Commander::from_env(api, Some(feed::Feed::spawn()), cli.state.clone(), cli.ledger.clone()).context("commander")?;
             tokio::time::sleep(std::time::Duration::from_secs(2)).await; // let the feed connect for /pair
-            println!("{}", c.handle(&format!("/{}", cmd.trim_start_matches('/')), "0", "cli").await);
+            if cmd.trim_start_matches('/') == "calculate" {
+                if let Some((t, b, _)) = c.calculate(false).await { println!("{t}\nbuttons: {:?}", b.iter().map(|x| &x.0).collect::<Vec<_>>()); }
+            } else {
+                println!("{}", c.handle(&format!("/{}", cmd.trim_start_matches('/')), "0", "cli").await);
+            }
         }
     }
     Ok(())
