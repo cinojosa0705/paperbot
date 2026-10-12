@@ -79,7 +79,7 @@ use crate::state::{heartbeat_age, ledger_rows, Params, State};
 use crate::RunArgs;
 use clap::Parser;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Answers the operator's commands in the configured chat. The only action that touches positions
 /// is `/liquidate`, which needs a fresh confirmation code and leaves the farm paused.
@@ -177,8 +177,52 @@ impl Commander {
     }
 
     pub fn spawn(self) {
+        let me = Arc::new(self);
+        let wd = me.clone();
+        tokio::spawn(async move { wd.watchdog().await });
         tokio::spawn(async move {
-            let _ = self.set_commands().await;
+            let this = me;
+            let _ = this.set_commands().await;
+            this.poll_loop().await;
+        });
+    }
+
+    /// If a pair is in flight and the engine's heartbeat goes quiet, alert at 45s and close at 120s.
+    async fn watchdog(&self) {
+        let mut alerted = false;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let st = self.state();
+            let Some(f) = st.in_flight.clone() else { alerted = false; continue };
+            let age = heartbeat_age(&self.state_path).unwrap_or(u64::MAX);
+            if age <= 45 {
+                alerted = false;
+                continue;
+            }
+            if !alerted {
+                alerted = true;
+                let _ = self.n.send_now(&format!("🚨 <b>Engine not responding</b> for {} with a pair open ({} {}×, ids {}) — closing it myself at 2 minutes",
+                    dur(age.min(99_999)), f.coin, f.leverage, f.position_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "))).await;
+            }
+            if age > 120 {
+                let (_tx, rx) = tokio::sync::watch::channel(false);
+                let note = match (Chain::new(&crate::positions::rpc_url()), self.feed.clone()) {
+                    (Ok(chain), Some(feed)) => match Engine::new(self.api.clone(), chain, feed, self.state(), RunArgs::parse_from(["run"]), self.state_path.clone(), self.ledger_path.clone(), rx) {
+                        Ok(mut eng) => match eng.close_all().await { Ok(()) => "closed".to_string(), Err(e) => format!("close failed: {e}") },
+                        Err(e) => format!("engine: {e}"),
+                    },
+                    _ => "no feed/rpc".into(),
+                };
+                let pp = Params::path(&self.state_path);
+                if let Some(mut p) = Params::load(&pp) { p.paused = true; let _ = p.save(&pp); }
+                let _ = self.n.send_now(&format!("🛑 <b>Watchdog</b>: engine silent {} — pair {} · farm paused. Restart the engine and /resume.", dur(age.min(99_999)), note)).await;
+                alerted = false;
+            }
+        }
+    }
+
+    async fn poll_loop(&self) {
+        {
             let mut offset: i64 = 0;
             let mut conflicts = 0u32;
             let mut last_expiry_warning = 0u64;
@@ -259,7 +303,7 @@ impl Commander {
                     }
                 }
             }
-        });
+        }
     }
 
     async fn set_commands(&self) -> Result<()> {

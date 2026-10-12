@@ -1,6 +1,6 @@
 {
   "market": "auto",
-  "move_pct": 0.3,
+  "move_pct": 0.45,
   "buffer_pct": 30.0,
   "capital_fraction": 1.0,
   "drawdown_stop_pct": 60.0,

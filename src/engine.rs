@@ -129,17 +129,36 @@ impl Engine {
         self.notify(format!("🛑 <b>Farm stopped</b> · {why}"));
     }
 
+    /// Supervised: a transient failure never ends the farm; an open pair is resumed, not abandoned.
     pub async fn run(mut self) -> Result<()> {
-        let r = self.run_inner().await;
-        if let Err(e) = &r {
-            // awaited: the process usually exits right after this
-            if let Some(n) = &self.notifier {
-                let _ = n.send_now(&format!("❌ <b>Farm error</b>\n{e}")).await;
+        let mut failures = 0u32;
+        loop {
+            match self.run_inner().await {
+                Ok(()) => {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    return Ok(());
+                }
+                Err(e) => {
+                    failures += 1;
+                    let fatal = self.stopping() || failures > 200;
+                    if fatal {
+                        if let Some(n) = &self.notifier {
+                            let _ = n.send_now(&format!("❌ <b>Farm error</b> (giving up)\n{e}")).await;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        return Err(e);
+                    }
+                    tracing::error!(error = %e, failures, "engine error; restarting the loop in 10s");
+                    if failures == 1 || failures % 10 == 0 {
+                        self.notify(format!("⚠️ <b>Engine error #{failures}</b> — resuming in 10s (open pair is kept)\n{e}"));
+                    }
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    if let Ok(st) = State::load(&self.state_path) {
+                        self.st = st;
+                    }
+                }
             }
         }
-        // let fire-and-forget notifications (stop reason, last cycle) flush before the runtime goes away
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        r
     }
 
     fn params_path(&self) -> PathBuf {
@@ -640,6 +659,7 @@ impl Engine {
         let mut last_move = 0.0;
         let mut liquidate = false;
         let mut low_polls = 0u32;
+        let mut poll_errs = 0u32;
         loop {
             tokio::select! {
                 _ = rx.changed() => {
@@ -662,7 +682,17 @@ impl Engine {
                         break;
                     }
                     if self.args.dry_run { continue; }
-                    let row = self.api.account_row(self.user).await?;
+                    let row = match self.api.account_row(self.user).await {
+                        Ok(r) => { poll_errs = 0; r }
+                        Err(err) => {
+                            poll_errs += 1;
+                            if poll_errs == 15 {
+                                tracing::warn!(%err, "account poll failing while a pair is open");
+                                self.notify("⚠️ exchange API unreachable while a pair is open — still watching the feed".to_string());
+                            }
+                            continue;
+                        }
+                    };
                     if row.open_positions < pair.ids.len() as u32 {
                         low_polls += 1;
                     } else {
