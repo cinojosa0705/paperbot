@@ -90,6 +90,7 @@ impl Engine {
             self.watch_and_close(pair, d, buf).await?;
         }
 
+        let mut stale_logged = false;
         loop {
             if self.stopping() {
                 break;
@@ -125,10 +126,14 @@ impl Engine {
 
             let coin = self.pick_coin(d, balance, floor, self.args.horizon_days - elapsed_days);
             let Some(mid) = self.feed.mid(coin.name).filter(|m| m.age() < Duration::from_secs(2)) else {
-                tracing::warn!(coin = coin.name, "feed stale; waiting");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                if !stale_logged {
+                    tracing::warn!(coin = coin.name, "feed stale; waiting");
+                    stale_logged = true;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             };
+            stale_logged = false;
             let margin_raw = self.size(&ts, balance, leverage)?;
             tracing::info!(
                 cycle = self.st.cycles_done + 1, coin = coin.name, rate,

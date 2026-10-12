@@ -2885,6 +2885,7 @@ dependencies = [
  "futures-util",
  "rand 0.8.8",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
