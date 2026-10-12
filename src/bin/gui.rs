@@ -268,7 +268,7 @@ impl App {
         });
 
         let hero = stack![
-            image(self.stars.clone()).width(Length::Fill).height(Length::Fixed(118.0)).content_fit(iced::ContentFit::Cover).opacity(0.55),
+            image(self.stars.clone()).width(Length::Fill).height(Length::Fixed(118.0)).content_fit(iced::ContentFit::Cover).opacity(0.55_f32),
             row![
                 column![
                     text("Mint $PAPER by losing on purpose").font(SANS_BOLD).size(20).color(FG),
@@ -284,7 +284,7 @@ impl App {
                 ]
                 .padding([14, 16])
                 .width(Length::Fill),
-                image(self.girl.clone()).height(Length::Fixed(118.0)).content_fit(iced::ContentFit::Contain).opacity(0.95),
+                image(self.girl.clone()).height(Length::Fixed(118.0)).content_fit(iced::ContentFit::Contain).opacity(0.95_f32),
             ]
             .align_y(Alignment::End),
         ];
@@ -486,7 +486,7 @@ fn panel<'a>(title: &str, meta: String, body: Element<'a, Message>) -> container
 }
 
 fn panel_with_bg<'a>(title: &str, meta: String, body: Element<'a, Message>, bg: image::Handle) -> container::Container<'a, Message> {
-    let art = container(image(bg).height(Length::Fill).content_fit(iced::ContentFit::Cover).opacity(0.10))
+    let art = container(image(bg).height(Length::Fill).content_fit(iced::ContentFit::Cover).opacity(0.10_f32))
         .width(Length::Fill)
         .height(Length::Fill)
         .align_x(iced::alignment::Horizontal::Right);

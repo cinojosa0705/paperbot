@@ -53,6 +53,19 @@ Ctrl-C closes any open pair, flushes the ledger and exits. If the process dies m
 ./target/release/paperbot close-all     # emergency: one Close intent for every open position
 ```
 
+## GUI
+
+```sh
+./target/release/paperbot-gui --move 0.5 --buffer-pct 25     # same PAPERBOT_STATE / PAPERBOT_LEDGER env
+```
+
+A compact iced window in papertrade's uwu dress: protocol chips (mint rate, LP, queue, supply),
+account (balance, queued, open positions, PAPER held, session expiry), the in-flight pair with a live
+move-to-trigger bar, the strategy card (leverage, bust guard, BTC vs ETH keep / cost / PAPER-per-$ and
+realised vol), a live mid sparkline with entry and trigger bands, and the cycle ledger. It reads the
+same files and endpoints the bot does and never signs or posts anything; pass the same `--move` /
+`--buffer-pct` you run the bot with so the strategy card matches.
+
 ## What it watches
 
 - **Price**: Hyperliquid's public `bbo` websocket — the same best bid/ask the Exchange's precompile
