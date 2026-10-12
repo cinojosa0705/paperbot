@@ -176,7 +176,7 @@ impl Commander {
     }
 
     fn help(&self) -> String {
-        let mut s = String::from("🧻 <b>paperbot</b> — info only, no trading commands\n");
+        let mut s = String::from("🧻 <b>UwU bot</b> — info only, no trading commands\n");
         for (c, d) in COMMANDS {
             s.push_str(&format!("/{c} — {d}\n"));
         }
@@ -189,7 +189,7 @@ impl Commander {
 
     async fn status(&self) -> String {
         let st = self.state();
-        let mut s = String::from("🧻 <b>paperbot status</b>\n");
+        let mut s = String::from("🧻 <b>UwU bot status</b>\n");
         match st.in_flight.as_ref() {
             Some(f) => s.push_str(&format!("pair open: {} {}× · ${:.0}/leg\n", f.coin, f.leverage, f.margin_raw as f64 / 1e18)),
             None => s.push_str("no pair open\n"),

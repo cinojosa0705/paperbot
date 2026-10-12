@@ -154,7 +154,7 @@ impl Engine {
             dry_run = self.args.dry_run, "paperbot starting"
         );
         self.notify(format!(
-            "🧻 <b>paperbot started</b>{}\nbalance ${:.2} · {}× · move {:.2}% · stop at −{:.0}% · market {}",
+            "🧻 <b>UwU bot started</b>{}\nbalance ${:.2} · {}× · move {:.2}% · stop at −{:.0}% · market {}",
             if self.args.dry_run { " (dry run)" } else { "" }, start_balance as f64 / E18, leverage, d * 100.0,
             self.args.drawdown_stop_pct, self.args.market
         ));
