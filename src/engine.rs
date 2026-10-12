@@ -509,13 +509,9 @@ impl Engine {
         tracing::info!(%row, "cycle done");
         ledger_append(&self.ledger_path, &row).context("ledger")?;
         let (mut tot_paper, mut tot_spent) = (0.0f64, 0.0f64);
-        if let Ok(txt) = std::fs::read_to_string(&self.ledger_path) {
-            for l in txt.lines() {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
-                    tot_paper += v["paper_minted"].as_f64().unwrap_or(0.0);
-                    tot_spent -= v["pnl_usd"].as_f64().unwrap_or(0.0);
-                }
-            }
+        for v in crate::state::ledger_rows(&self.ledger_path) {
+            tot_paper += v["paper_minted"].as_f64().unwrap_or(0.0);
+            tot_spent -= v["pnl_usd"].as_f64().unwrap_or(0.0);
         }
         self.notify(format!(
             "✅ <b>cycle {}</b> {} · {:.3}% in {}m{:02}s\npnl ${:.2} · minted {:.0} PAPER · {}\ntotal {:.0} PAPER for ${:.2} → {:.0} PAPER/$ · rate {:.1}",

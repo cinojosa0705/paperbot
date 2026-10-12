@@ -71,3 +71,9 @@ pub fn ledger_append(path: &Path, row: &serde_json::Value) -> Result<()> {
     writeln!(f, "{row}")?;
     Ok(())
 }
+
+pub fn ledger_rows(path: &Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect())
+        .unwrap_or_default()
+}

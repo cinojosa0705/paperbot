@@ -73,6 +73,13 @@ export PAPERBOT_TG_TOKEN=123456:ABC…     # @BotFather token
 export PAPERBOT_TG_CHAT=123456789        # your chat id (message the bot, then /getUpdates)
 ```
 
+Put them (and the state/ledger paths) in `~/.paperbot/env` and `source` it — never in the repo.
+
+**Commands** (info only — there are deliberately no trading commands): `/status`, `/stats`, `/pair`
+(the open pair valued live off the Hyperliquid mid), `/rate`, `/cycles [n]`, `/help`. The poller runs
+in whichever process has the feed (the GUI, or CLI `run`); only one process should poll at a time
+(`PAPERBOT_TG_COMMANDS=0` disables it in the other). `paperbot tg-reply status` prints a reply offline.
+
 When both are set the engine pings on start, every pair open, every cycle result (pnl, PAPER minted,
 running PAPER/$), aborts (naked leg, wide entry gap, a leg vanishing), the stop reason, and fatal
 errors. Sends are fire-and-forget and never delay a close. The GUI's `tg` chip shows whether it's on.

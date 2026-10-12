@@ -1,6 +1,7 @@
 use alloy::primitives::Address;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use paperbot::notify::Commander;
 use paperbot::{api, engine, feed, positions, session, sign, state, RunArgs, CHAIN_ID, EXCHANGE};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -35,6 +36,9 @@ enum Cmd {
     Run(RunArgs),
     /// Emergency: close every open position in one intent.
     CloseAll,
+    /// Print what the Telegram command bot would answer (no Telegram needed).
+    #[command(hide = true)]
+    TgReply { cmd: String },
 }
 
 fn ctrl_c() -> tokio::sync::watch::Receiver<bool> {
@@ -102,6 +106,9 @@ async fn main() -> Result<()> {
                 "user {:#x} · balance ${:.2} · queued ${:.2} · open positions {} · PAPER {:.0}",
                 eng.user, row.balance_raw as f64 / 1e18, row.queued_raw as f64 / 1e18, row.open_positions, row.paper_raw as f64 / 1e18
             );
+            if let Some(c) = Commander::from_env(eng.api.clone(), Some(eng.feed.clone()), cli.state.clone(), cli.ledger.clone()) {
+                c.spawn();
+            }
             eng.run().await?;
         }
         Cmd::CloseAll => {
@@ -110,6 +117,13 @@ async fn main() -> Result<()> {
             )
             .context("engine")?;
             eng.close_all().await?;
+        }
+        Cmd::TgReply { cmd } => {
+            std::env::set_var("PAPERBOT_TG_TOKEN", std::env::var("PAPERBOT_TG_TOKEN").unwrap_or("x".into()));
+            std::env::set_var("PAPERBOT_TG_CHAT", std::env::var("PAPERBOT_TG_CHAT").unwrap_or("0".into()));
+            let c = Commander::from_env(api, Some(feed::Feed::spawn()), cli.state.clone(), cli.ledger.clone()).context("commander")?;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await; // let the feed connect for /pair
+            println!("{}", c.handle(&format!("/{}", cmd.trim_start_matches('/'))).await);
         }
     }
     Ok(())

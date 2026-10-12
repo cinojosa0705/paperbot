@@ -240,7 +240,14 @@ impl App {
             btc: svg::Handle::from_memory(BTC_SVG),
             eth: svg::Handle::from_memory(ETH_SVG),
         };
-        (app, Task::perform(async { Feed::spawn() }, Message::FeedReady))
+        let (api, sp, lp) = (app.api.clone(), app.state_path.clone(), app.ledger_path.clone());
+        (app, Task::perform(async move {
+            let f = Feed::spawn();
+            if let Some(c) = paperbot::notify::Commander::from_env(api, Some(f.clone()), sp, lp) {
+                c.spawn();
+            }
+            f
+        }, Message::FeedReady))
     }
 
     fn theme(&self) -> Theme {
