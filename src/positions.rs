@@ -96,23 +96,28 @@ impl Chain {
 
     async fn logs(&self, topics: Value, from: u64, to: u64) -> Result<Vec<Value>> {
         let mut out = Vec::new();
-        let range = max_range();
+        let mut range = max_range();
         let mut a = from;
         while a <= to {
             let b = (a + range - 1).min(to);
-            let r = self
-                .call(
-                    "eth_getLogs",
-                    json!([{
-                        "address": crate::EXCHANGE,
-                        "fromBlock": format!("0x{a:x}"),
-                        "toBlock": format!("0x{b:x}"),
-                        "topics": topics,
-                    }]),
-                )
-                .await?;
-            out.extend(r.as_array().cloned().unwrap_or_default());
-            a = b + 1;
+            let params = json!([{
+                "address": crate::EXCHANGE,
+                "fromBlock": format!("0x{a:x}"),
+                "toBlock": format!("0x{b:x}"),
+                "topics": topics,
+            }]);
+            match self.call("eth_getLogs", params).await {
+                Ok(r) => {
+                    out.extend(r.as_array().cloned().unwrap_or_default());
+                    a = b + 1;
+                }
+                // some provider edges enforce a smaller window than others: shrink and redo this chunk
+                Err(e) if range > 10 && e.to_string().to_lowercase().contains("block range") => {
+                    tracing::warn!(range, "provider rejected the log window; falling back to 10-block chunks");
+                    range = 10;
+                }
+                Err(e) => return Err(e),
+            }
         }
         Ok(out)
     }

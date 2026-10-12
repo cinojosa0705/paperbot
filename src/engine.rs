@@ -291,7 +291,7 @@ impl Engine {
                 self.watch_and_close(pair, td, buf).await?;
                 continue;
             }
-            let balance = row.balance_raw;
+            let balance = self.equity(&row);
             if balance > peak {
                 if balance as f64 > peak as f64 * 1.1 {
                     self.notify(format!("💰 deposit detected: equity ${:.2} (was ${:.2}); drawdown stop now at ${:.2}",
@@ -325,7 +325,7 @@ impl Engine {
                 continue;
             }
 
-            let coin = self.pick_coin(d, balance, floor, self.args.horizon_days - elapsed_days);
+            let coin = self.pick_coin(d, row.balance_raw, floor, self.args.horizon_days - elapsed_days);
             let Some(mid) = self.feed.mid(coin.name).filter(|m| m.age() < Duration::from_secs(2)) else {
                 if !stale_logged {
                     tracing::warn!(coin = coin.name, "feed stale; waiting");
@@ -335,7 +335,7 @@ impl Engine {
                 continue;
             };
             stale_logged = false;
-            let margin_raw = match self.size(&ts, balance, leverage) {
+            let margin_raw = match self.size(&ts, row.balance_raw, leverage) {
                 Ok(m) => m,
                 Err(err) => {
                     // config can't open a pair on this balance: say so, keep waiting for /set
@@ -392,8 +392,14 @@ impl Engine {
         Ok(())
     }
 
+    /// available + margin locked in our open pair (+ queued): what the drawdown stop should see
+    fn equity(&self, row: &crate::api::AccountRow) -> u128 {
+        let locked = if row.open_positions > 0 { self.st.in_flight.as_ref().map(|f| 2 * f.margin_raw).unwrap_or(0) } else { 0 };
+        row.balance_raw + locked + row.queued_raw
+    }
     async fn balance(&self) -> Result<u128> {
-        Ok(self.api.account_row(self.user).await?.balance_raw)
+        let row = self.api.account_row(self.user).await?;
+        Ok(self.equity(&row))
     }
 
     fn size(&self, ts: &TradingState, balance: u128, leverage: u32) -> Result<u128> {
