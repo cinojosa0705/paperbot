@@ -185,7 +185,8 @@ impl Engine {
         }
         let start = Instant::now();
         let start_balance = self.balance().await?;
-        let mut floor = (start_balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
+        let mut peak = start_balance;
+        let mut floor = (peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
         tracing::info!(
             balance = start_balance as f64 / E18, leverage, move = d, floor = floor as f64 / E18,
             dry_run = self.args.dry_run, "paperbot starting"
@@ -248,7 +249,7 @@ impl Engine {
                         d = self.args.move_pct / 100.0;
                         buf = self.args.buffer_pct / 100.0;
                         leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
-                        floor = (start_balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
+                        floor = (peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
                         tracing::info!(params = %p.summary(), "params updated");
                         self.notify(format!("🔧 <b>params</b>: {}", p.summary()));
                     }
@@ -291,11 +292,20 @@ impl Engine {
                 continue;
             }
             let balance = row.balance_raw;
-            let dd = 1.0 - balance as f64 / start_balance as f64;
+            if balance > peak {
+                if balance as f64 > peak as f64 * 1.1 {
+                    self.notify(format!("💰 deposit detected: equity ${:.2} (was ${:.2}); drawdown stop now at ${:.2}",
+                        balance as f64 / E18, peak as f64 / E18, balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0) / E18));
+                }
+                peak = balance;
+                floor = (peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
+                dd_alerted = [false, false];
+            }
+            let dd = 1.0 - balance as f64 / peak as f64;
             for (i, m) in [0.25, 0.5].iter().enumerate() {
                 if dd >= *m && !dd_alerted[i] {
                     dd_alerted[i] = true;
-                    self.notify(format!("📉 drawdown {:.0}%: balance ${:.2} from ${:.2}", dd * 100.0, balance as f64 / E18, start_balance as f64 / E18));
+                    self.notify(format!("📉 drawdown {:.0}%: balance ${:.2} from peak ${:.2}", dd * 100.0, balance as f64 / E18, peak as f64 / E18));
                 }
             }
             if balance <= floor {
