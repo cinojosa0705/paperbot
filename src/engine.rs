@@ -169,7 +169,8 @@ impl Engine {
             );
         }
         let max_notional = ts.instruments.iter().map(|i| i.max_notional_raw).min().unwrap_or(u128::MAX);
-        Ok(per_leg.min(max_notional / leverage as u128))
+        let per_leg = per_leg.min(max_notional / leverage as u128);
+        Ok(per_leg / 10u128.pow(18) * 10u128.pow(18))
     }
 
     /// Price one cycle on each coin against both remaining budgets; cheaper market wins.
