@@ -297,8 +297,9 @@ impl Commander {
         match st.in_flight.as_ref() {
             Some(f) => {
                 let age = dur(crate::sign::now_secs().saturating_sub(f.opened_at));
+                let target = if f.target_move > 0.0 { f.target_move * 100.0 } else { p.move_pct };
                 match self.pair_value(f) {
-                    Some((_, _, _, net, _, mv)) => s.push_str(&format!("pair: {} {}× · {age} · move {:.3}% of {:.2}% · net now {}\n", f.coin, f.leverage, mv * 100.0, p.move_pct, money(net))),
+                    Some((_, _, _, net, _, mv)) => s.push_str(&format!("pair: {} {}× · {age} · move {:.3}% of {:.2}% · net now {}\n", f.coin, f.leverage, mv * 100.0, target, money(net))),
                     None => s.push_str(&format!("pair: {} {}× · {age}\n", f.coin, f.leverage)),
                 }
             }
@@ -306,12 +307,14 @@ impl Commander {
         }
         if let Some(u) = st.user {
             match self.api.account_row(u).await {
-                Ok(a) => s.push_str(&format!(
-                    "account: balance {} · in use {} · queued {} · PAPER held {:.0}\n",
-                    money(a.balance_raw as f64 / 1e18),
-                    money(st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0)),
-                    money(a.queued_raw as f64 / 1e18), a.paper_raw as f64 / 1e18
-                )),
+                Ok(a) => {
+                    let avail = a.balance_raw as f64 / 1e18;
+                    let in_use = if a.open_positions > 0 { st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0) } else { 0.0 };
+                    s.push_str(&format!(
+                        "account: equity {} (available {} · in use {}) · queued {} · PAPER held {:.0}\n",
+                        money(avail + in_use), money(avail), money(in_use), money(a.queued_raw as f64 / 1e18), a.paper_raw as f64 / 1e18
+                    ))
+                }
                 Err(e) => s.push_str(&format!("account: {e}\n")),
             }
         } else {
@@ -322,8 +325,8 @@ impl Commander {
         let day: Vec<_> = rows.iter().filter(|r| r["ts"].as_f64().unwrap_or(0.0) >= now - 86_400.0).collect();
         let sum = |rs: &[&serde_json::Value]| {
             let paper: f64 = rs.iter().map(|r| r["paper_minted"].as_f64().unwrap_or(0.0)).sum();
-            let spent: f64 = -rs.iter().map(|r| r["pnl_usd"].as_f64().unwrap_or(0.0)).sum::<f64>();
-            (paper, spent)
+            let spent: f64 = -rs.iter().map(|r| r["pnl_usd"].as_f64().unwrap_or(0.0)).sum::<f64>() + 0.0;
+            (paper + 0.0, spent)
         };
         let (dp, ds) = sum(&day);
         let all: Vec<_> = rows.iter().collect();
@@ -347,7 +350,7 @@ impl Commander {
         let Some((mid, lp, sp, net, kw, mv)) = self.pair_value(&f) else {
             return format!("pair open on {} {}× but no live feed in this process", f.coin, f.leverage);
         };
-        let d = p.move_pct / 100.0;
+        let d = if f.target_move > 0.0 { f.target_move } else { p.move_pct / 100.0 };
         let bust_guard = d * (1.0 + p.buffer_pct / 100.0) - 0.0005;
         let rate = self.api.summary().await.map(|s| s.mint_rate()).unwrap_or(0.0);
         let elapsed = crate::sign::now_secs().saturating_sub(f.opened_at);
@@ -361,7 +364,7 @@ impl Commander {
             "🟢 <b>{} pair</b> {}× · ${:.0}/leg · open {}\nentries {:.1} / {:.1} → mid {:.1}\nmove {:.3}% of {:.2}% (bust guard {:.3}%){eta}\nlong {} · short {}\nnet if closed now <b>{}</b> (winner keeps {:.1}%)\nPAPER if closed now <b>{:.0}</b> @ {:.1}/$\nids {}",
             f.coin, f.leverage, f.margin_raw as f64 / 1e18, dur(elapsed),
             f.entries.first().copied().unwrap_or(f.mid_at_open), f.entries.get(1).copied().unwrap_or(f.mid_at_open), mid,
-            mv * 100.0, p.move_pct, bust_guard * 100.0,
+            mv * 100.0, d * 100.0, bust_guard * 100.0,
             money(lp), money(sp), money(net), kw * 100.0, rate * 0.98 * (-l).max(0.0), rate,
             f.position_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
         )
@@ -374,7 +377,7 @@ impl Commander {
         }
         let agg = |rs: &[&serde_json::Value]| -> (usize, f64, f64, f64) {
             let paper: f64 = rs.iter().map(|r| r["paper_minted"].as_f64().unwrap_or(0.0)).sum();
-            let spent: f64 = -rs.iter().map(|r| r["pnl_usd"].as_f64().unwrap_or(0.0)).sum::<f64>();
+            let spent: f64 = -rs.iter().map(|r| r["pnl_usd"].as_f64().unwrap_or(0.0)).sum::<f64>() + 0.0;
             let secs: f64 = rs.iter().map(|r| r["elapsed_s"].as_f64().unwrap_or(0.0)).sum();
             (rs.len(), paper, spent, secs)
         };

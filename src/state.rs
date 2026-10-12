@@ -17,6 +17,9 @@ pub struct InFlight {
     pub entries: Vec<f64>,
     #[serde(default)]
     pub longs: Vec<bool>,
+    /// the move this pair closes at (fraction), fixed at open time
+    #[serde(default)]
+    pub target_move: f64,
     pub mid_at_open: f64,
     pub opened_at: u64,
     pub margin_raw: u128,

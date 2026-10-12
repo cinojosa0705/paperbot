@@ -200,7 +200,8 @@ impl Engine {
         if let Some(f) = self.st.in_flight.clone() {
             tracing::warn!(ids = ?f.position_ids, "resuming an in-flight pair");
             let pair = self.recover(&f).await?;
-            self.watch_and_close(pair, d, buf).await?;
+            let td = if f.target_move > 0.0 { f.target_move } else { d };
+            self.watch_and_close(pair, td, buf).await?;
         }
 
         if let Some(exp) = self.st.session_expiry {
@@ -412,7 +413,7 @@ impl Engine {
         let s2 = sign::sign(&self.signer, &self.domain, &short)?;
         self.st.in_flight = Some(InFlight {
             coin: coin.name.into(), instrument_id: coin.id,
-            intent_ids: vec![s1.intent_id, s2.intent_id], position_ids: vec![], entries: vec![], longs: vec![],
+            intent_ids: vec![s1.intent_id, s2.intent_id], position_ids: vec![], entries: vec![], longs: vec![], target_move: self.args.move_pct / 100.0,
             mid_at_open: mid, opened_at: sign::now_secs(), margin_raw, leverage,
         });
         self.st.save(&self.state_path)?;

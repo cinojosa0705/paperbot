@@ -542,6 +542,7 @@ impl App {
             Some(f) => {
                 let mid = self.mids.back().map(|m| m.1).unwrap_or(f.mid_at_open);
                 let mv = (mid / f.mid_at_open - 1.0).abs();
+                let d = if f.target_move > 0.0 { f.target_move } else { d };
                 let prog = (mv / d).clamp(0.0, 1.0) as f32;
                 let elapsed = sign::now_secs().saturating_sub(f.opened_at);
                 let icon = if f.coin == "ETH" { self.eth.clone() } else { self.btc.clone() };
