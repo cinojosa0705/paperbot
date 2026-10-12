@@ -213,6 +213,7 @@ impl Engine {
         let mut stale_logged = false;
         let (mut paused_logged, mut bad_params_logged) = (false, false);
         let mut open_failures = 0u32;
+        let mut size_logged = false;
         let mut dd_alerted = [false, false];
         loop {
             heartbeat_touch(&self.state_path);
@@ -299,7 +300,21 @@ impl Engine {
                 continue;
             };
             stale_logged = false;
-            let margin_raw = self.size(&ts, balance, leverage)?;
+            let margin_raw = match self.size(&ts, balance, leverage) {
+                Ok(m) => m,
+                Err(err) => {
+                    // config can't open a pair on this balance: say so, keep waiting for /set
+                    if !size_logged {
+                        let max_move = 1.0 / ((ts.min_open_notional_raw as f64 / (balance as f64 * self.args.capital_fraction / 2.0)).ceil() * (1.0 + buf)) * 100.0;
+                        tracing::warn!(%err, "cannot size a pair; waiting for params");
+                        self.notify(format!("⚠️ <b>can't open a pair</b>: {err}\nwith this balance the move must be ≤ {max_move:.2}% at a {:.0}% buffer — /set move …", buf * 100.0));
+                        size_logged = true;
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+            };
+            size_logged = false;
             tracing::info!(
                 cycle = self.st.cycles_done + 1, coin = coin.name, rate,
                 margin = margin_raw as f64 / E18, leverage, mid = mid.px, "opening pair"

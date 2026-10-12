@@ -223,6 +223,23 @@ impl Commander {
             "set" => match (arg, arg2) {
                 (Some(k), Some(v)) => {
                     let mut p = self.params();
+                    // a move that can't size a $10k-notional pair on the current balance is refused up front
+                    if let (Ok(st), Ok(ts)) = (State::load(&self.state_path), self.api.trading_state().await) {
+                        if let Some(u) = st.user {
+                            if let Ok(a) = self.api.account_row(u).await {
+                                let mut q = p.clone();
+                                if q.set(&k.to_lowercase(), v).is_ok() {
+                                    let per_leg = (a.balance_raw as f64 / 1e18 + st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0)) * q.capital_fraction / 2.0;
+                                    let lev = ((1.0 / (q.move_pct / 100.0 * (1.0 + q.buffer_pct / 100.0))).round()).clamp(1.0, 1000.0);
+                                    let min_notional = ts.min_open_notional_raw as f64 / 1e18;
+                                    if per_leg.floor() * lev < min_notional {
+                                        let max_move = 1.0 / ((min_notional / per_leg.floor()).ceil() * (1.0 + q.buffer_pct / 100.0)) * 100.0;
+                                        return format!("❌ {k} = {v} can't open a pair: ${:.0}/leg × {lev:.0}× = ${:.0} notional, minimum is ${min_notional:.0}\nwith this balance the move must be ≤ {max_move:.2}% at a {:.0}% buffer (or add funds)", per_leg.floor(), per_leg.floor() * lev, q.buffer_pct);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     match p.set(&k.to_lowercase(), v) {
                         Ok(sum) => match p.save(&Params::path(&self.state_path)) {
                             Ok(()) => format!("🔧 {name} set {k} = {v}\n{sum}\napplies from the next pair"),
@@ -519,15 +536,15 @@ impl Commander {
                 }
                 let still_open = self.api.account_row(user).await.map(|a| a.open_positions).unwrap_or(open);
                 // 2. nothing (or no engine) closed them: do it from here
-                let mut note = String::new();
+                let note: String;
                 if still_open > 0 {
                     let (_tx, rx) = tokio::sync::watch::channel(false);
                     match (Chain::new(&crate::positions::rpc_url()), self.feed.clone()) {
                         (Ok(chain), Some(feed)) => match Engine::new(self.api.clone(), chain, feed, self.state(), RunArgs::parse_from(["run"]), self.state_path.clone(), self.ledger_path.clone(), rx) {
-                            Ok(mut eng) => match eng.close_all().await {
-                                Ok(()) => note = "closed from the responder".into(),
-                                Err(e) => note = format!("close-all failed: {e}"),
-                            },
+                            Ok(mut eng) => { note = match eng.close_all().await {
+                                Ok(()) => "closed from the responder".into(),
+                                Err(e) => format!("close-all failed: {e}"),
+                            } }
                             Err(e) => note = format!("engine: {e}"),
                         },
                         _ => note = "no feed/rpc in this process".into(),
