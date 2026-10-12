@@ -218,10 +218,9 @@ impl Api {
         })
     }
 
-    pub async fn account_trades(&self, user: Address, limit: u32) -> Result<Vec<Trade>> {
-        let v = self
-            .get_value(&format!("/query/accounts/{user:#x}/trades?limit={limit}"))
-            .await?;
+    /// Latest closed positions, newest first. The route only accepts its default page (or `limit=75`).
+    pub async fn account_trades(&self, user: Address) -> Result<Vec<Trade>> {
+        let v = self.get_value(&format!("/query/accounts/{user:#x}/trades")).await?;
         Ok(serde_json::from_value(v["items"].clone()).context("trades items")?)
     }
 

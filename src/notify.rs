@@ -65,6 +65,8 @@ pub struct Commander {
     feed: Option<Feed>,
     state_path: PathBuf,
     ledger_path: PathBuf,
+    /// Telegram user ids allowed to issue commands (PAPERBOT_TG_USERS, comma-separated). Empty = anyone in the chat.
+    allow: Vec<String>,
 }
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -92,6 +94,7 @@ impl Commander {
             feed,
             state_path,
             ledger_path,
+            allow: std::env::var("PAPERBOT_TG_USERS").unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
         })
     }
 
@@ -110,6 +113,11 @@ impl Commander {
                             let chat = m["chat"]["id"].as_i64().map(|i| i.to_string()).unwrap_or_default();
                             let Some(text) = m["text"].as_str() else { continue };
                             if chat != self.n.chat || !text.starts_with('/') {
+                                continue;
+                            }
+                            let from = m["from"]["id"].as_i64().map(|i| i.to_string()).unwrap_or_default();
+                            if !self.allow.is_empty() && !self.allow.contains(&from) {
+                                tracing::info!(from, "ignored command from a non-allowlisted user");
                                 continue;
                             }
                             let reply = self.handle(text).await;

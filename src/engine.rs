@@ -550,7 +550,7 @@ impl Engine {
         let want: Vec<String> = pair.ids.iter().map(|i| i.to_string()).collect();
         let mut trades = Vec::new();
         for _ in 0..15 {
-            trades = self.api.account_trades(self.user, 20).await?;
+            trades = self.api.account_trades(self.user).await?;
             trades.retain(|t| want.contains(&t.position_id));
             if trades.len() == pair.ids.len() {
                 break;

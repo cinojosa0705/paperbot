@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
                     "user {user:#x} · session expiry {:?} · cycles done {} · in flight {:?}",
                     st.session_expiry, st.cycles_done, st.in_flight.as_ref().map(|f| &f.position_ids)
                 );
-                for t in api.account_trades(user, 5).await? {
+                for t in api.account_trades(user).await? {
                     println!(
                         "  {} {} {} x{} margin {} pnl {} minted {}",
                         t.timestamp_ms, t.symbol, if t.is_long { "LONG" } else { "SHORT" }, t.leverage, t.margin_raw, t.adjusted_pnl_raw, t.paper_minted_raw
