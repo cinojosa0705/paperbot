@@ -12,6 +12,11 @@ pub struct InFlight {
     pub instrument_id: u32,
     pub intent_ids: Vec<B256>,
     pub position_ids: Vec<U256>,
+    /// entry price and side per position id, same order
+    #[serde(default)]
+    pub entries: Vec<f64>,
+    #[serde(default)]
+    pub longs: Vec<bool>,
     pub mid_at_open: f64,
     pub opened_at: u64,
     pub margin_raw: u128,

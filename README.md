@@ -66,6 +66,27 @@ realised vol), a live mid sparkline with entry and trigger bands, and the cycle 
 same files and endpoints the bot does and never signs or posts anything; pass the same `--move` /
 `--buffer-pct` you run the bot with so the strategy card matches.
 
+## Telegram
+
+```sh
+export PAPERBOT_TG_TOKEN=123456:ABC…     # @BotFather token
+export PAPERBOT_TG_CHAT=123456789        # your chat id (message the bot, then /getUpdates)
+```
+
+When both are set the engine pings on start, every pair open, every cycle result (pnl, PAPER minted,
+running PAPER/$), aborts (naked leg, wide entry gap, a leg vanishing), the stop reason, and fatal
+errors. Sends are fire-and-forget and never delay a close. The GUI's `tg` chip shows whether it's on.
+
+## Running on a laptop
+
+```sh
+caffeinate -i ./target/release/paperbot-gui        # keeps the machine awake while the window is open
+```
+
+Starting the farm from the GUI runs the engine inside the GUI process: closing the window stops it
+(open pairs are *not* closed on a hard kill — use "stop after cycle" or `close-all`). The CLI `run`
+is equivalent and survives the window; don't run both against the same state file.
+
 ## What it watches
 
 - **Price**: Hyperliquid's public `bbo` websocket — the same best bid/ask the Exchange's precompile

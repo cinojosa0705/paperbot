@@ -185,6 +185,25 @@ impl Api {
         })
     }
 
+    /// HyperCore spot USDC for `user` (the balance a papertrade deposit is sent from / withdrawn to).
+    pub async fn hypercore_spot_usdc(&self, user: Address) -> Result<f64> {
+        let v: Value = self
+            .http
+            .post("https://api.hyperliquid.xyz/info")
+            .json(&json!({"type": "spotClearinghouseState", "user": format!("{user:#x}")}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        Ok(v["balances"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|b| b["coin"] == "USDC")
+            .and_then(|b| b["total"].as_str()?.parse().ok())
+            .unwrap_or(0.0))
+    }
+
     pub async fn account_row(&self, user: Address) -> Result<AccountRow> {
         let v = self.get_value(&format!("/state/leaderboard/accounts/{user:#x}")).await?;
         let r = &v["selfRow"];

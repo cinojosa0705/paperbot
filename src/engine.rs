@@ -2,6 +2,7 @@
 
 use crate::api::{Api, TradingState};
 use crate::feed::Feed;
+use crate::notify::Notifier;
 use crate::positions::Chain;
 use crate::sign::{self, Close, Intent, OpenPosition};
 use crate::state::{ledger_append, InFlight, State};
@@ -11,6 +12,7 @@ use alloy::sol_types::Eip712Domain;
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
@@ -59,6 +61,7 @@ pub struct Engine {
     pub ledger_path: PathBuf,
     pub st: State,
     pub shutdown: watch::Receiver<bool>,
+    pub notifier: Option<Notifier>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -94,11 +97,47 @@ struct Pair {
 }
 
 impl Engine {
+    /// Build an engine from a saved session; the running bot never sees the master key.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        api: Api, chain: Chain, feed: Feed, st: State, args: RunArgs,
+        state_path: PathBuf, ledger_path: PathBuf, shutdown: watch::Receiver<bool>,
+    ) -> Result<Self> {
+        let user = st.user.context("no session registered — run `paperbot register`")?;
+        let key = st.session_key.clone().context("no session key in state")?;
+        if let Some(exp) = st.session_expiry {
+            if exp <= sign::now_secs() {
+                bail!("session key expired — register again");
+            }
+        }
+        let signer = PrivateKeySigner::from_str(&key).context("session key")?;
+        let domain = sign::exchange_domain(crate::CHAIN_ID, Address::from_str(crate::EXCHANGE)?);
+        Ok(Engine { api, chain, feed, signer, user, domain, args, state_path, ledger_path, st, shutdown, notifier: Notifier::from_env() })
+    }
+
+    fn notify(&self, s: impl Into<String>) {
+        if let Some(n) = &self.notifier {
+            n.send(s.into());
+        }
+    }
+    fn stop_note(&self, why: &str) {
+        tracing::info!(why, "stopping");
+        self.notify(format!("🛑 <b>farm stopped</b>: {why}"));
+    }
+
+    pub async fn run(mut self) -> Result<()> {
+        let r = self.run_inner().await;
+        if let Err(e) = &r {
+            self.notify(format!("❌ <b>farm error</b>: {e}"));
+        }
+        r
+    }
+
     fn stopping(&self) -> bool {
         *self.shutdown.borrow()
     }
 
-    pub async fn run(mut self) -> Result<()> {
+    async fn run_inner(&mut self) -> Result<()> {
         let d = self.args.move_pct / 100.0;
         let buf = self.args.buffer_pct / 100.0;
         let leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
@@ -114,6 +153,11 @@ impl Engine {
             balance = start_balance as f64 / E18, leverage, move = d, floor = floor as f64 / E18,
             dry_run = self.args.dry_run, "paperbot starting"
         );
+        self.notify(format!(
+            "🧻 <b>paperbot started</b>{}\nbalance ${:.2} · {}× · move {:.2}% · stop at −{:.0}% · market {}",
+            if self.args.dry_run { " (dry run)" } else { "" }, start_balance as f64 / E18, leverage, d * 100.0,
+            self.args.drawdown_stop_pct, self.args.market
+        ));
 
         // crash recovery: a pair we opened and never closed
         if let Some(f) = self.st.in_flight.clone() {
@@ -125,28 +169,29 @@ impl Engine {
         let mut stale_logged = false;
         loop {
             if self.stopping() {
+                self.stop_note("stop requested");
                 break;
             }
             if let Some(max) = self.args.max_cycles {
                 if self.st.cycles_done >= max {
-                    tracing::info!("max cycles reached");
+                    self.stop_note("max cycles reached");
                     break;
                 }
             }
             let elapsed_days = start.elapsed().as_secs_f64() / 86_400.0;
             if elapsed_days >= self.args.horizon_days {
-                tracing::info!("horizon reached");
+                self.stop_note("horizon reached");
                 break;
             }
             let balance = self.balance().await?;
             if balance <= floor {
-                tracing::info!(balance = balance as f64 / E18, "drawdown stop");
+                self.stop_note(&format!("drawdown stop at ${:.2}", balance as f64 / E18));
                 break;
             }
             let summary = self.api.summary().await?;
             let rate = summary.mint_rate();
             if rate < self.args.rate_floor {
-                tracing::info!(rate, "mint rate below floor");
+                self.stop_note(&format!("mint rate {rate:.1} below floor"));
                 break;
             }
             let ts = self.api.trading_state().await?;
@@ -250,7 +295,7 @@ impl Engine {
         let s2 = sign::sign(&self.signer, &self.domain, &short)?;
         self.st.in_flight = Some(InFlight {
             coin: coin.name.into(), instrument_id: coin.id,
-            intent_ids: vec![s1.intent_id, s2.intent_id], position_ids: vec![],
+            intent_ids: vec![s1.intent_id, s2.intent_id], position_ids: vec![], entries: vec![], longs: vec![],
             mid_at_open: mid, opened_at: sign::now_secs(), margin_raw, leverage,
         });
         self.st.save(&self.state_path)?;
@@ -284,6 +329,7 @@ impl Engine {
         let opened = self.wait_opened(from_block, 2, OPEN_TIMEOUT).await?;
         if opened.len() < 2 {
             tracing::error!(n = opened.len(), "naked leg: only one position landed; closing it");
+            self.notify("⚠️ <b>naked leg</b>: only one position landed, closing it".to_string());
             self.close_ids(opened.iter().map(|o| o.position_id).collect()).await?;
             self.clear_in_flight()?;
             bail!("pair aborted: one leg only");
@@ -293,11 +339,19 @@ impl Engine {
         let gap_bps = (entries[0] - entries[1]).abs() / mid * 1e4;
         if let Some(f) = self.st.in_flight.as_mut() {
             f.position_ids = ids.clone();
+            f.entries = entries.clone();
+            f.longs = opened.iter().map(|o| o.is_long).collect();
         }
         self.st.save(&self.state_path)?;
         tracing::info!(?ids, ?entries, gap_bps, "pair open");
+        self.notify(format!(
+            "🟢 <b>pair open</b> {} · {}× · ${:.0}/leg\nentries {:.1} / {:.1} · gap {:.1} bps · ids {}",
+            coin.name, leverage, margin_raw as f64 / E18, entries[0], entries[1], gap_bps,
+            ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
+        ));
         if gap_bps > self.args.max_entry_gap_bps {
             tracing::warn!(gap_bps, "entry gap too wide; closing pair");
+            self.notify(format!("⚠️ entry gap {gap_bps:.1} bps too wide, pair closed"));
             self.close_ids(ids.clone()).await?;
             self.clear_in_flight()?;
             bail!("pair aborted: entry gap {gap_bps:.1} bps");
@@ -337,6 +391,10 @@ impl Engine {
             self.clear_in_flight()?;
             bail!("nothing to recover");
         }
+        if let Some(x) = self.st.in_flight.as_mut() {
+            x.entries = live.iter().map(|o| o.entry_px_raw as f64 / coin.scale).collect();
+            x.longs = live.iter().map(|o| o.is_long).collect();
+        }
         Ok(Pair {
             coin,
             ids: live.iter().map(|o| o.position_id).collect(),
@@ -371,6 +429,7 @@ impl Engine {
                     let row = self.api.account_row(self.user).await?;
                     if row.open_positions < pair.ids.len() as u32 {
                         tracing::error!(open = row.open_positions, "a leg vanished (liquidation?); closing the rest");
+                        self.notify(format!("⚠️ <b>a leg vanished</b> (liquidation?) — open positions {}, closing the rest", row.open_positions));
                         break;
                     }
                 }
@@ -448,7 +507,23 @@ impl Engine {
             "kinds": trades.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
         });
         tracing::info!(%row, "cycle done");
-        ledger_append(&self.ledger_path, &row).context("ledger")
+        ledger_append(&self.ledger_path, &row).context("ledger")?;
+        let (mut tot_paper, mut tot_spent) = (0.0f64, 0.0f64);
+        if let Ok(txt) = std::fs::read_to_string(&self.ledger_path) {
+            for l in txt.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+                    tot_paper += v["paper_minted"].as_f64().unwrap_or(0.0);
+                    tot_spent -= v["pnl_usd"].as_f64().unwrap_or(0.0);
+                }
+            }
+        }
+        self.notify(format!(
+            "✅ <b>cycle {}</b> {} · {:.3}% in {}m{:02}s\npnl ${:.2} · minted {:.0} PAPER · {}\ntotal {:.0} PAPER for ${:.2} → {:.0} PAPER/$ · rate {:.1}",
+            self.st.cycles_done + 1, pair.coin.name, mv * 100.0, pair.opened_at.elapsed().as_secs() / 60, pair.opened_at.elapsed().as_secs() % 60,
+            pnl as f64 / E18, minted as f64 / E18, trades.iter().map(|t| t.kind.as_str()).collect::<Vec<_>>().join("/"),
+            tot_paper, tot_spent, if tot_spent > 0.0 { tot_paper / tot_spent } else { 0.0 }, self.api.summary().await.map(|s| s.mint_rate()).unwrap_or(0.0)
+        ));
+        Ok(())
     }
 
     fn clear_in_flight(&mut self) -> Result<()> {
@@ -468,6 +543,7 @@ impl Engine {
             .map(|o| o.position_id)
             .collect();
         tracing::info!(?ids, "close-all");
+        self.notify(format!("🛑 <b>close-all</b>: {} position(s)", ids.len()));
         self.close_ids(ids).await?;
         self.clear_in_flight()
     }

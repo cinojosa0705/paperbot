@@ -73,6 +73,13 @@ impl Chain {
         Ok(v["result"].clone())
     }
 
+    /// ERC-20 balanceOf(user), raw units.
+    pub async fn erc20_balance(&self, token: &str, user: Address) -> Result<u128> {
+        let data = format!("0x70a08231{}", topic_addr(user).trim_start_matches("0x"));
+        let r = self.call("eth_call", json!([{"to": token, "data": data}, "latest"])).await?;
+        Ok(words(r.as_str().unwrap_or("0x")).first().map(|w| w.to::<u128>()).unwrap_or(0))
+    }
+
     pub async fn block_number(&self) -> Result<u64> {
         Ok(hex_u64(&self.call("eth_blockNumber", json!([])).await?))
     }
