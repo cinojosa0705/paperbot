@@ -662,15 +662,24 @@ impl Engine {
 
     /// Emergency: close everything this user has open (from the last ~2h of logs).
     pub async fn close_all(&mut self) -> Result<()> {
-        let latest = self.chain.block_number().await?;
-        let from = latest.saturating_sub(8000);
-        let opened = self.chain.opened(self.user, from, latest).await?;
-        let closed = self.chain.closed(self.user, from, latest).await?;
-        let ids: Vec<U256> = opened
-            .iter()
-            .filter(|o| !closed.iter().any(|c| c.position_id == o.position_id))
-            .map(|o| o.position_id)
-            .collect();
+        // the pair we opened is in state.json; only fall back to a log scan when nothing is recorded
+        let mut ids: Vec<U256> = self.st.in_flight.as_ref().map(|f| f.position_ids.clone()).unwrap_or_default();
+        let open_count = self.api.account_row(self.user).await.map(|a| a.open_positions).unwrap_or(0);
+        if ids.is_empty() && open_count > 0 {
+            let latest = self.chain.block_number().await?;
+            let from = latest.saturating_sub(3000);
+            let opened = self.chain.opened(self.user, from, latest).await?;
+            let closed = self.chain.closed(self.user, from, latest).await?;
+            ids = opened
+                .iter()
+                .filter(|o| !closed.iter().any(|c| c.position_id == o.position_id))
+                .map(|o| o.position_id)
+                .collect();
+        }
+        if open_count == 0 {
+            tracing::info!("close-all: nothing open");
+            return self.clear_in_flight();
+        }
         tracing::info!(?ids, "close-all");
         self.notify(format!("🛑 <b>close-all</b>: {} position(s)", ids.len()));
         self.close_ids(ids).await?;

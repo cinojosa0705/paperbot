@@ -59,18 +59,21 @@ impl Chain {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
-        let v: Value = self
-            .http
-            .post(&self.rpc)
-            .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-            .send()
-            .await?
-            .json()
-            .await?;
-        if let Some(e) = v.get("error") {
-            return Err(anyhow!("rpc {method}: {e}"));
+        let body = json!({"jsonrpc":"2.0","id":1,"method":method,"params":params});
+        let mut delay = 1u64;
+        for attempt in 1..=5 {
+            let v: Value = self.http.post(&self.rpc).json(&body).send().await?.json().await?;
+            match v.get("error") {
+                None => return Ok(v["result"].clone()),
+                Some(e) if e.to_string().to_lowercase().contains("rate limit") && attempt < 5 => {
+                    tracing::debug!(attempt, "rpc rate limited; backing off {delay}s");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                    delay *= 2;
+                }
+                Some(e) => return Err(anyhow!("rpc {method}: {e}")),
+            }
         }
-        Ok(v["result"].clone())
+        unreachable!()
     }
 
     /// ERC-20 balanceOf(user), raw units.
