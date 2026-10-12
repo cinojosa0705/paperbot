@@ -1,7 +1,7 @@
 //! The dashboard's farm model, fed with live inputs: sweep the move per market and rank by PAPER
 //! over a horizon, with capital bleed and rate decay.
 
-use crate::engine::keep_frac;
+use crate::engine::{keep_frac, min_buffer};
 
 #[derive(Debug, Clone)]
 pub struct Rec {
@@ -85,7 +85,8 @@ pub fn optimize(vols: &[(&'static str, f64)], i: &Inputs) -> Vec<Rec> {
         let mut k = 0;
         while k <= 60 {
             let d = 0.0005 * 200f64.powf(k as f64 / 60.0); // 0.05% … 10%
-            let buf = ((0.0015 / d) * 1.05).max(0.25);
+            // the same headroom rule the engine enforces, rounded up to a whole percent
+            let buf = ((min_buffer(d) * 100.0).ceil() / 100.0).max(0.25);
             if let Some(r) = sim(d, buf, pm, vol, i) {
                 if best.as_ref().map(|b| r.paper_total > b.paper_total).unwrap_or(true) {
                     best = Some(r);

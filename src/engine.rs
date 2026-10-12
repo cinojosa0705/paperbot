@@ -45,9 +45,13 @@ pub struct RunArgs {
 }
 
 const E18: f64 = 1e18;
-const BUST_BUFFER: f64 = 0.0005; // the contract trips liquidation ~5 bps before zero equity
+pub const BUST_BUFFER: f64 = 0.0005; // the contract trips liquidation ~5 bps before zero equity
 /// target-to-bust headroom the close path needs (a close took 6.6s once while BTC moved 0.045%)
-const CLOSE_HEADROOM: f64 = 0.0010;
+pub const CLOSE_HEADROOM: f64 = 0.0010;
+/// Smallest buffer (fraction) for a move `d` such that the close lands CLOSE_HEADROOM before the bust.
+pub fn min_buffer(d: f64) -> f64 {
+    (BUST_BUFFER + CLOSE_HEADROOM) / d
+}
 const OPEN_TIMEOUT: Duration = Duration::from_secs(90);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -187,7 +191,7 @@ impl Engine {
 
     /// The buffer the farm actually runs with: at least enough for the close to land before the bust.
     fn safe_buffer(&self, d: f64, requested: f64) -> f64 {
-        let min_buf = (BUST_BUFFER + CLOSE_HEADROOM) / d;
+        let min_buf = min_buffer(d);
         if requested < min_buf {
             let b = (min_buf * 100.0).ceil() / 100.0;
             tracing::warn!(requested = requested * 100.0, used = b * 100.0, "buffer raised for close headroom");

@@ -101,7 +101,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("pair", "the open pair live: pnl, net if closed, progress, ETA"),
     ("positions", "every open position, flags untracked ones"),
     ("strategy", "BTC vs ETH: keep, cost, PAPER per $, vol, cycle time"),
-    ("calculate", "optimal move per market from live stats, with apply buttons"),
+    ("calculate", "optimal move per market from live stats, with apply buttons (also posted hourly)"),
     ("stats", "performance: all-time, 24h, per market, pace, supply share"),
     ("rate", "mint curve, measured decay, half-life"),
     ("cycles", "last cycles table (/cycles 10)"),
@@ -228,16 +228,15 @@ impl Commander {
             let mut last_expiry_warning = 0u64;
             let mut last_calc = 0u64;
             loop {
-                // every 15 minutes: recompute the optimum and post it if it moved materially
+                // every hour: recompute the optimum and post it
                 let now = crate::sign::now_secs();
-                if now.saturating_sub(last_calc) >= 900 {
+                if now.saturating_sub(last_calc) >= 3600 {
                     last_calc = now;
                     if let Some((text, buttons, sig)) = self.calculate(true).await {
                         let changed = self.last_rec.lock().unwrap().as_deref() != Some(sig.as_str());
-                        if changed {
-                            *self.last_rec.lock().unwrap() = Some(sig);
-                            let _ = self.n.send_keyboard(&text, &buttons).await;
-                        }
+                        *self.last_rec.lock().unwrap() = Some(sig);
+                        let text = if changed { text } else { format!("{text}\n<i>unchanged since the last check</i>") };
+                        let _ = self.n.send_keyboard(&text, &buttons).await;
                     }
                 }
                 if let Ok(st) = State::load(&self.state_path) {
@@ -630,7 +629,7 @@ impl Commander {
         if recs.is_empty() {
             return Some((format!("{}no valid configuration: equity {} can't reach the {} minimum notional", h("🧮 Optimizer"), money(equity), money(inp.min_notional)), vec![], "none".into()));
         }
-        let mut s = h(&format!("🧮 Optimizer · 7-day horizon{}", if quiet { " · 15-min check" } else { "" }));
+        let mut s = h(&format!("🧮 Optimizer · 7-day horizon{}", if quiet { " · hourly check" } else { "" }));
         s.push_str(&row("inputs", format!("equity {} · rate {:.2}/$ · decay {:.0}%/day · vol BTC {:.2}% ETH {:.2}%{}",
             money(equity), sum.mint_rate(), decay * 100.0, vols[0].1 * 100.0, vols[1].1 * 100.0, if sampled { "" } else { " (defaults)" })));
         s.push_str("<code>       move   buf   lev  cyc/d  cost  PAPER/$ PAPER/day</code>\n");

@@ -116,7 +116,7 @@ impl Params {
     }
     /// Minimum buffer so the close lands ≥0.10% before the 5 bps bust trigger (the engine enforces it too).
     pub fn min_buffer_pct(move_pct: f64) -> f64 {
-        (0.0015 / (move_pct / 100.0) * 100.0).ceil()
+        (crate::engine::min_buffer(move_pct / 100.0) * 100.0).ceil()
     }
     pub fn validate(&self) -> std::result::Result<(), String> {
         if !matches!(self.market.as_str(), "auto" | "btc" | "eth") { return Err("market must be auto, btc or eth".into()); }
