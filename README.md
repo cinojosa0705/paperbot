@@ -103,6 +103,14 @@ errors. Sends are fire-and-forget and never delay a close. The GUI's `tg` chip s
 
 ## Running on a laptop
 
+**Supervised (recommended):** `scripts/install-launchd.sh` installs three user launchd agents from
+`~/.paperbot/env` — `com.paperbot.engine` (`run`), `com.paperbot.tg` (`tg-serve`) and
+`com.paperbot.caffeinate` — with `KeepAlive`, so each is restarted within ~10 s if it dies and comes
+back at login. On restart the engine adopts whatever pair is open. Logs: `~/.paperbot/run.log`,
+`tg-serve.log`. Re-run the script after changing the env file; `launchctl bootout gui/$(id -u)/com.paperbot.engine`
+stops one. The responder's watchdog closes an unwatched pair if the engine heartbeat goes silent for 2 minutes.
+
+
 ```sh
 caffeinate -i ./target/release/paperbot-gui        # keeps the machine awake while the window is open
 ```
