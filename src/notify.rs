@@ -54,7 +54,7 @@ impl Notifier {
 use crate::api::Api;
 use crate::engine::keep_frac;
 use crate::feed::Feed;
-use crate::state::{ledger_rows, State};
+use crate::state::{ledger_rows, Params, State};
 use std::path::PathBuf;
 
 /// Answers stats/info commands in the configured chat. No trading commands exist on purpose.
@@ -73,6 +73,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("pair", "the open pair, live off the Hyperliquid mid"),
     ("rate", "mint curve state"),
     ("cycles", "last cycles (/cycles 10)"),
+    ("params", "live farm parameters"),
+    ("set", "change one: /set move 0.4 | buffer 40 | market eth | capital 0.5 | ddstop 50 | ratefloor 8 | maxcycles 20|off"),
+    ("pause", "no new pairs; the open pair finishes"),
+    ("resume", "continue opening pairs"),
     ("help", "this list"),
 ];
 
@@ -165,7 +169,30 @@ impl Commander {
         let mut it = text.split_whitespace();
         let cmd = it.next().unwrap_or("").trim_start_matches('/').split('@').next().unwrap_or("").to_lowercase();
         let arg = it.next();
+        let arg2 = it.next();
         match cmd.as_str() {
+            "params" => format!("🔧 <b>params</b>\n{}\nchanges apply from the next pair", self.params().summary()),
+            "set" => match (arg, arg2) {
+                (Some(k), Some(v)) => {
+                    let mut p = self.params();
+                    match p.set(&k.to_lowercase(), v) {
+                        Ok(sum) => match p.save(&Params::path(&self.state_path)) {
+                            Ok(()) => format!("🔧 set {k} = {v}\n{sum}\napplies from the next pair"),
+                            Err(e) => format!("could not save params: {e}"),
+                        },
+                        Err(e) => format!("❌ {e}"),
+                    }
+                }
+                _ => "usage: /set &lt;key&gt; &lt;value&gt; — keys: move buffer market capital ddstop ratefloor maxcycles".into(),
+            },
+            "pause" | "resume" => {
+                let mut p = self.params();
+                p.paused = cmd == "pause";
+                match p.save(&Params::path(&self.state_path)) {
+                    Ok(()) => if p.paused { "⏸ paused — the open pair (if any) finishes, no new pairs".into() } else { "▶️ resumed".into() },
+                    Err(e) => format!("could not save params: {e}"),
+                }
+            }
             "status" => self.status().await,
             "stats" => self.stats(),
             "pair" | "position" => self.pair().await,
@@ -176,11 +203,15 @@ impl Commander {
     }
 
     fn help(&self) -> String {
-        let mut s = String::from("🧻 <b>UwU bot</b> — info only, no trading commands\n");
+        let mut s = String::from("🧻 <b>UwU bot</b> — stats and knobs, no trading commands\n");
         for (c, d) in COMMANDS {
             s.push_str(&format!("/{c} — {d}\n"));
         }
         s
+    }
+
+    fn params(&self) -> Params {
+        Params::load(&Params::path(&self.state_path)).unwrap_or_default()
     }
 
     fn state(&self) -> State {

@@ -75,8 +75,16 @@ export PAPERBOT_TG_CHAT=123456789        # your chat id (message the bot, then /
 
 Put them (and the state/ledger paths) in `~/.paperbot/env` and `source` it — never in the repo.
 
-**Commands** (info only — there are deliberately no trading commands): `/status`, `/stats`, `/pair`
-(the open pair valued live off the Hyperliquid mid), `/rate`, `/cycles [n]`, `/help`. The poller runs
+**Commands** (no trading commands, deliberately): `/status`, `/stats`, `/pair` (the open pair valued
+live off the Hyperliquid mid), `/rate`, `/cycles [n]`, `/params`, `/set <key> <value>`, `/pause`,
+`/resume`, `/help`. `/set` keys: `move` (%), `buffer` (%), `market` (auto|btc|eth), `capital` (0–1),
+`ddstop` (%), `ratefloor`, `maxcycles` (n|off); each change is validated (the buffer must clear the
+bust guard for the chosen move) and **applies from the next pair** — never under an open one.
+`/pause` stops new pairs while the open one finishes; `/resume` continues.
+
+All three surfaces share one file, `params.json` next to `state.json`: Telegram `/set` and the GUI's
+**apply** button write it, the engine re-reads it at the top of every cycle, and the GUI's strategy
+header shows what's live. The CLI flags only seed the file the first time. The poller runs
 in whichever process has the feed (the GUI, or CLI `run`); only one process should poll at a time
 (`PAPERBOT_TG_COMMANDS=0` disables it in the other). `paperbot tg-reply status` prints a reply offline.
 

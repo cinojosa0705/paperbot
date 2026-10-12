@@ -5,7 +5,7 @@ use crate::feed::Feed;
 use crate::notify::Notifier;
 use crate::positions::Chain;
 use crate::sign::{self, Close, Intent, OpenPosition};
-use crate::state::{ledger_append, InFlight, State};
+use crate::state::{ledger_append, InFlight, Params, State};
 use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::Eip712Domain;
@@ -133,14 +133,42 @@ impl Engine {
         r
     }
 
+    fn params_path(&self) -> PathBuf {
+        Params::path(&self.state_path)
+    }
+    pub fn params_from_args(a: &RunArgs) -> Params {
+        Params {
+            market: a.market.clone(), move_pct: a.move_pct, buffer_pct: a.buffer_pct, capital_fraction: a.capital_fraction,
+            drawdown_stop_pct: a.drawdown_stop_pct, rate_floor: a.rate_floor, max_cycles: a.max_cycles, paused: false,
+        }
+    }
+    /// Overlay live params onto the run args; true if anything changed.
+    fn apply_params(&mut self, p: &Params) -> bool {
+        let before = Self::params_from_args(&self.args);
+        self.args.market = p.market.clone();
+        self.args.move_pct = p.move_pct;
+        self.args.buffer_pct = p.buffer_pct;
+        self.args.capital_fraction = p.capital_fraction;
+        self.args.drawdown_stop_pct = p.drawdown_stop_pct;
+        self.args.rate_floor = p.rate_floor;
+        self.args.max_cycles = p.max_cycles;
+        Self::params_from_args(&self.args) != before
+    }
+
     fn stopping(&self) -> bool {
         *self.shutdown.borrow()
     }
 
     async fn run_inner(&mut self) -> Result<()> {
-        let d = self.args.move_pct / 100.0;
-        let buf = self.args.buffer_pct / 100.0;
-        let leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
+        // params.json wins if present (Telegram /set, GUI apply); otherwise seed it from the args
+        let pp = self.params_path();
+        match Params::load(&pp) {
+            Some(p) if p.validate().is_ok() => { self.apply_params(&p); }
+            _ => { let _ = Self::params_from_args(&self.args).save(&pp); }
+        }
+        let mut d = self.args.move_pct / 100.0;
+        let mut buf = self.args.buffer_pct / 100.0;
+        let mut leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
         // the close level must sit below the bust guard, else the guard fires first
         let min_buf = (BUST_BUFFER + 0.0003) / d;
         if buf < min_buf {
@@ -148,7 +176,7 @@ impl Engine {
         }
         let start = Instant::now();
         let start_balance = self.balance().await?;
-        let floor = (start_balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
+        let mut floor = (start_balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
         tracing::info!(
             balance = start_balance as f64 / E18, leverage, move = d, floor = floor as f64 / E18,
             dry_run = self.args.dry_run, "paperbot starting"
@@ -167,10 +195,44 @@ impl Engine {
         }
 
         let mut stale_logged = false;
+        let (mut paused_logged, mut bad_params_logged) = (false, false);
         loop {
             if self.stopping() {
                 self.stop_note("stop requested");
                 break;
+            }
+            // live params take effect here, i.e. at the next pair — never under an open one
+            if let Some(p) = Params::load(&pp) {
+                if let Err(err) = p.validate() {
+                    if !bad_params_logged {
+                        tracing::warn!(%err, "ignoring invalid params.json");
+                        self.notify(format!("⚠️ params ignored: {err}"));
+                        bad_params_logged = true;
+                    }
+                } else {
+                    bad_params_logged = false;
+                    if p.paused {
+                        if !paused_logged {
+                            tracing::info!("paused");
+                            self.notify("⏸ <b>paused</b> — no new pairs until /resume".to_string());
+                            paused_logged = true;
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                    if paused_logged {
+                        self.notify("▶️ resumed".to_string());
+                        paused_logged = false;
+                    }
+                    if self.apply_params(&p) {
+                        d = self.args.move_pct / 100.0;
+                        buf = self.args.buffer_pct / 100.0;
+                        leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
+                        floor = (start_balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
+                        tracing::info!(params = %p.summary(), "params updated");
+                        self.notify(format!("🔧 <b>params</b>: {}", p.summary()));
+                    }
+                }
             }
             if let Some(max) = self.args.max_cycles {
                 if self.st.cycles_done >= max {

@@ -11,7 +11,7 @@ use paperbot::engine::{keep_frac, Engine};
 use paperbot::feed::Feed;
 use paperbot::notify::Notifier;
 use paperbot::positions::{Chain, RPC_URL};
-use paperbot::state::State;
+use paperbot::state::{Params, State};
 use paperbot::{session, sign, RunArgs, CHAIN_ID, EXCHANGE, USDC};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -151,6 +151,7 @@ enum Message {
     BufS(String),
     CapS(String),
     DdS(String),
+    ApplyParams,
     StartBot,
     StopBot,
     CloseAll,
@@ -194,6 +195,7 @@ struct App {
     dd_s: String,
     bot: Bot,
     bot_note: Option<(String, bool)>,
+    live_params: Option<Params>,
     logs: LogBuf,
     girl: image::Handle,
     stars: image::Handle,
@@ -233,6 +235,7 @@ impl App {
             dd_s: "60".into(),
             bot: Bot::Idle,
             bot_note: None,
+            live_params: None,
             logs,
             girl: image::Handle::from_bytes(GIRL),
             stars: image::Handle::from_bytes(STARS),
@@ -267,6 +270,7 @@ impl App {
             self.user = st.user;
             self.st = st;
         }
+        self.live_params = Params::load(&Params::path(&self.state_path));
         if let Ok(txt) = std::fs::read_to_string(&self.ledger_path) {
             self.cycles = txt
                 .lines()
@@ -283,6 +287,14 @@ impl App {
                 })
                 .collect();
         }
+    }
+
+    fn params_from_inputs(&self) -> Result<Params, String> {
+        let a = self.run_args()?;
+        let mut p = Engine::params_from_args(&a);
+        p.paused = self.live_params.as_ref().map(|l| l.paused).unwrap_or(false);
+        p.validate()?;
+        Ok(p)
     }
 
     fn run_args(&self) -> Result<RunArgs, String> {
@@ -339,8 +351,18 @@ impl App {
             Message::BufS(s) => self.buf_s = s,
             Message::CapS(s) => self.cap_s = s,
             Message::DdS(s) => self.dd_s = s,
+            Message::ApplyParams => {
+                match self.params_from_inputs().and_then(|p| p.save(&Params::path(&self.state_path)).map(|_| p).map_err(|e| e.to_string())) {
+                    Ok(p) => self.bot_note = Some((format!("params applied — next pair: {}", p.summary()), true)),
+                    Err(e) => self.bot_note = Some((e, false)),
+                }
+            }
             Message::StartBot => {
                 if self.running() { return Task::none(); }
+                if let Err(e) = self.params_from_inputs().and_then(|p| p.save(&Params::path(&self.state_path)).map_err(|e| e.to_string())) {
+                    self.bot_note = Some((e, false));
+                    return Task::none();
+                }
                 let Some(feed) = self.feed.clone() else { self.bot_note = Some(("feed not ready".into(), false)); return Task::none(); };
                 let args = match self.run_args() { Ok(a) => a, Err(e) => { self.bot_note = Some((e, false)); return Task::none(); } };
                 let st = match State::load(&self.state_path) { Ok(s) => s, Err(e) => { self.bot_note = Some((e.to_string(), false)); return Task::none(); } };
@@ -587,7 +609,7 @@ impl App {
         let lev = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
         let seg = |name: &'static str, label: &'static str| {
             let on = self.market == name;
-            small_btn(label, if self.running() { None } else { Some(Message::Market(name)) }, if on { PINK_D } else { PANEL2 }, if on { FG } else { FG2 })
+            small_btn(label, Some(Message::Market(name)), if on { PINK_D } else { PANEL2 }, if on { FG } else { FG2 })
         };
         let num = |label: &'static str, v: &str, on: fn(String) -> Message| -> Element<'_, Message> {
             row![text(label).size(10).color(FG2), text_input("", v).font(MONO).size(11).padding(4).width(Length::Fixed(52.0)).on_input(on).style(input_style)]
@@ -600,7 +622,7 @@ impl App {
         };
         let strategy = panel(
             "Strategy",
-            format!("{lev}× · bust guard {:.3}%", (d * (1.0 + buf) - 0.0005) * 100.0),
+            self.live_params.as_ref().map(|p| format!("live: {}", p.summary())).unwrap_or_else(|| format!("{lev}× · bust guard {:.3}%", (d * (1.0 + buf) - 0.0005) * 100.0)),
             column![
                 row![seg("auto", "AUTO"), seg("btc", "BTC"), seg("eth", "ETH"), Space::with_width(8),
                      num("move %", &self.move_s, Message::MoveS), num("buffer %", &self.buf_s, Message::BufS)].spacing(5).align_y(Alignment::Center),
@@ -612,6 +634,7 @@ impl App {
                 .spacing(14),
                 row![
                     small_btn(start_label, if self.st.session_key.is_some() { start_msg } else { None }, if matches!(self.bot, Bot::Running(_)) { PANEL2 } else { PINK_D }, FG),
+                    small_btn("apply", Some(Message::ApplyParams), PANEL2, LILAC),
                     small_btn("close all", if self.running() || self.st.session_key.is_none() { None } else { Some(Message::CloseAll) }, PANEL2, RED),
                     Space::with_width(Length::Fill),
                     text(self.bot_note.as_ref().map(|(m, _)| m.clone()).unwrap_or_default()).size(10)
