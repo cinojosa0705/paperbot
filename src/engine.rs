@@ -62,6 +62,10 @@ pub struct Engine {
     pub st: State,
     pub shutdown: watch::Receiver<bool>,
     pub notifier: Option<Notifier>,
+    /// which leg to send first: the side the relayer refused last (longs are the crowded side today)
+    pub short_first: bool,
+    /// in auto mode, skip this coin on the next pick after an admission refusal
+    pub avoid: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -112,7 +116,7 @@ impl Engine {
         }
         let signer = PrivateKeySigner::from_str(&key).context("session key")?;
         let domain = sign::exchange_domain(crate::CHAIN_ID, Address::from_str(crate::EXCHANGE)?);
-        Ok(Engine { api, chain, feed, signer, user, domain, args, state_path, ledger_path, st, shutdown, notifier: Notifier::from_env() })
+        Ok(Engine { api, chain, feed, signer, user, domain, args, state_path, ledger_path, st, shutdown, notifier: Notifier::from_env(), short_first: false, avoid: None })
     }
 
     fn notify(&self, s: impl Into<String>) {
@@ -201,6 +205,7 @@ impl Engine {
 
         let mut stale_logged = false;
         let (mut paused_logged, mut bad_params_logged) = (false, false);
+        let mut open_failures = 0u32;
         loop {
             if self.stopping() {
                 self.stop_note("stop requested");
@@ -284,7 +289,33 @@ impl Engine {
                 margin = margin_raw as f64 / E18, leverage, mid = mid.px, "opening pair"
             );
 
-            let pair = self.open_pair(coin, margin_raw, leverage, mid.px).await?;
+            let pair = match self.open_pair(coin, margin_raw, leverage, mid.px).await {
+                Ok(p) => p,
+                Err(err) => {
+                    let s = err.to_string();
+                    open_failures += 1;
+                    if s.contains("admission_rejected") {
+                        if open_failures == 1 || open_failures % 15 == 0 {
+                            self.notify(format!(
+                                "⚠️ open refused on {} — {s}\nretrying every 20s{}", coin.name,
+                                if self.args.market == "auto" { ", alternating markets" } else { "" }
+                            ));
+                        }
+                        tracing::warn!(%s, "open refused; retrying in 20s");
+                        self.avoid = Some(coin.name);
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        continue;
+                    }
+                    if open_failures >= 3 {
+                        return Err(err);
+                    }
+                    tracing::warn!(%s, "open failed; retrying in 10s");
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    continue;
+                }
+            };
+            open_failures = 0;
+            self.avoid = None;
             self.watch_and_close(pair, d, buf).await?;
         }
         Ok(())
@@ -326,7 +357,11 @@ impl Engine {
             let cost = (1.0 - keep_frac(d, c.pos_mult)) * (balance as f64 / E18) / 2.0;
             cost / rem_cap.max(1.0) + (d / vol).powi(2) / days_left
         };
-        if price(ETH, 0.031) < price(BTC, 0.024) { ETH } else { BTC }
+        match self.avoid {
+            Some("BTC") => ETH,
+            Some("ETH") => BTC,
+            _ => if price(ETH, 0.031) < price(BTC, 0.024) { ETH } else { BTC },
+        }
     }
 
     async fn submit<T: Intent>(&mut self, msg: &T) -> Result<sign::Signed> {
@@ -371,27 +406,26 @@ impl Engine {
             tracing::info!(long = %serde_json::Value::Object(s1.body.clone()), short = %serde_json::Value::Object(s2.body.clone()), "DRY RUN: would POST both opens");
             return Ok(Pair { coin, ids: vec![U256::ZERO, U256::ZERO], entries: vec![mid, mid], margin_raw, leverage, opened_at: Instant::now(), mid_open: mid });
         }
-        let (r1, r2) = tokio::join!(
-            self.api.post_intent(s1.action, &s1.body),
-            self.api.post_intent(s2.action, &s2.body)
-        );
-        let (a1, a2) = match (r1, r2) {
-            (Ok(a), Ok(b)) => (a, b),
-            (Ok(_), Err(e)) | (Err(e), Ok(_)) => {
-                tracing::error!(error = %e, "one open was refused; closing whatever landed");
-                let opened = self.wait_opened(from_block, 1, OPEN_TIMEOUT).await.unwrap_or_default();
-                if !opened.is_empty() {
-                    self.close_ids(opened.iter().map(|o| o.position_id).collect()).await?;
-                }
-                self.clear_in_flight()?;
-                bail!("pair aborted: {e}");
+        // Sequential, riskier side first: a refusal of the first leg costs nothing; only a refusal of
+        // the second leaves a naked leg, which is closed at once. The refused side goes first next time.
+        let (first, second) = if self.short_first { (&s2, &s1) } else { (&s1, &s2) };
+        let (first_side, second_side) = if self.short_first { ("short", "long") } else { ("long", "short") };
+        if let Err(err) = self.api.post_intent(first.action, &first.body).await {
+            self.clear_in_flight()?;
+            bail!("open refused ({first_side} first, nothing landed): {err}");
+        }
+        if let Err(err) = self.api.post_intent(second.action, &second.body).await {
+            tracing::error!(error = %err, "second open refused; closing the first leg");
+            self.notify(format!("⚠️ {} {second_side} refused ({err}) — closing the naked {first_side}", coin.name));
+            self.short_first = !self.short_first;
+            let opened = self.wait_opened(from_block, 1, OPEN_TIMEOUT).await.unwrap_or_default();
+            if !opened.is_empty() {
+                self.close_ids(opened.iter().map(|o| o.position_id).collect()).await?;
             }
-            (Err(a), Err(b)) => {
-                self.clear_in_flight()?;
-                bail!("both opens refused: {a} / {b}");
-            }
-        };
-        tracing::debug!(long = a1.intent_id, short = a2.intent_id, "opens accepted");
+            self.clear_in_flight()?;
+            bail!("open refused ({second_side} second): {err}");
+        }
+        tracing::debug!("opens accepted");
 
         let opened = self.wait_opened(from_block, 2, OPEN_TIMEOUT).await?;
         if opened.len() < 2 {
