@@ -72,6 +72,7 @@ same files and endpoints the bot does and never signs or posts anything; pass th
 export PAPERBOT_TG_TOKEN=123456:ABC…     # @BotFather token
 export PAPERBOT_TG_CHAT=-100…            # the group id
 export PAPERBOT_TG_USERS=111,222         # user ids allowed to issue commands (unset = anyone in the group)
+export PAPERBOT_RPC=https://…            # HyperEVM JSON-RPC (Alchemy etc.); the public node is the fallback and rate-limits log scans
 ```
 
 Put them (and the state/ledger paths) in `~/.paperbot/env` and `source` it — never in the repo.

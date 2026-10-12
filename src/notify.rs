@@ -54,7 +54,7 @@ impl Notifier {
 use crate::api::Api;
 use crate::engine::{keep_frac, Engine};
 use crate::feed::Feed;
-use crate::positions::{Chain, RPC_URL};
+use crate::positions::Chain;
 use crate::state::{heartbeat_age, ledger_rows, Params, State};
 use crate::RunArgs;
 use clap::Parser;
@@ -519,7 +519,7 @@ impl Commander {
                 let mut note = String::new();
                 if still_open > 0 {
                     let (_tx, rx) = tokio::sync::watch::channel(false);
-                    match (Chain::new(RPC_URL), self.feed.clone()) {
+                    match (Chain::new(&crate::positions::rpc_url()), self.feed.clone()) {
                         (Ok(chain), Some(feed)) => match Engine::new(self.api.clone(), chain, feed, self.state(), RunArgs::parse_from(["run"]), self.state_path.clone(), self.ledger_path.clone(), rx) {
                             Ok(mut eng) => match eng.close_all().await {
                                 Ok(()) => note = "closed from the responder".into(),

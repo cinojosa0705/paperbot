@@ -8,6 +8,10 @@ use serde_json::{json, Value};
 use std::str::FromStr;
 
 pub const RPC_URL: &str = "https://rpc.hyperliquid.xyz/evm";
+/// PAPERBOT_RPC (e.g. an Alchemy endpoint) or the public node.
+pub fn rpc_url() -> String {
+    std::env::var("PAPERBOT_RPC").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| RPC_URL.to_string())
+}
 /// PositionOpened(uint256 indexed positionId, address indexed user,
 ///   instrumentId, isLong, useDebt, entryPriceRaw, marginRaw, leverage)
 pub const TOPIC_OPENED: &str = "0x88451ea1189f73b554f0bf39c09868560ed149b3d788fcc933ff66ba926827f3";

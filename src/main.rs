@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
         }
         Cmd::Run(args) => {
             let eng = engine::Engine::new(
-                api, positions::Chain::new(positions::RPC_URL)?, feed::Feed::spawn(), st, args, cli.state.clone(), cli.ledger.clone(), ctrl_c(),
+                api, positions::Chain::new(&positions::rpc_url())?, feed::Feed::spawn(), st, args, cli.state.clone(), cli.ledger.clone(), ctrl_c(),
             )?;
             let row = eng.api.account_row(eng.user).await?;
             println!(
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
         }
         Cmd::CloseAll => {
             let mut eng = engine::Engine::new(
-                api, positions::Chain::new(positions::RPC_URL)?, feed::Feed::spawn(), st, RunArgs::parse_from(["run"]), cli.state.clone(), cli.ledger.clone(), ctrl_c(),
+                api, positions::Chain::new(&positions::rpc_url())?, feed::Feed::spawn(), st, RunArgs::parse_from(["run"]), cli.state.clone(), cli.ledger.clone(), ctrl_c(),
             )
             .context("engine")?;
             eng.close_all().await?;

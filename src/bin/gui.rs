@@ -10,7 +10,7 @@ use paperbot::api::{AccountRow, Api, Summary};
 use paperbot::engine::{keep_frac, Engine};
 use paperbot::feed::Feed;
 use paperbot::notify::Notifier;
-use paperbot::positions::{Chain, RPC_URL};
+use paperbot::positions::Chain;
 use paperbot::state::{Params, State};
 use paperbot::{session, sign, RunArgs, CHAIN_ID, EXCHANGE, USDC};
 use std::collections::VecDeque;
@@ -208,7 +208,7 @@ impl App {
     fn new(cli: Cli, logs: LogBuf) -> (Self, Task<Message>) {
         let app = App {
             api: Api::new(&cli.api).expect("api client"),
-            chain: Chain::new(RPC_URL).expect("rpc client"),
+            chain: Chain::new(&paperbot::positions::rpc_url()).expect("rpc client"),
             state_path: cli.state,
             ledger_path: cli.ledger,
             feed: None,
