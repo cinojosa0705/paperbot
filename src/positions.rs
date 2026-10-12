@@ -17,7 +17,10 @@ pub fn rpc_url() -> String {
 pub const TOPIC_OPENED: &str = "0x88451ea1189f73b554f0bf39c09868560ed149b3d788fcc933ff66ba926827f3";
 /// PositionClosed(uint256 indexed positionId, address indexed user, exitPriceRaw, …)
 pub const TOPIC_CLOSED: &str = "0x87902ed2451849f465fc4d36a01d7f5c67b53af12f63ee85d2814a2d582f89bf";
-const MAX_RANGE: u64 = 1000; // node limit per eth_getLogs
+/// blocks per eth_getLogs call: 1000 on the public node, 10 on Alchemy's free tier (PAPERBOT_RPC_LOG_RANGE)
+fn max_range() -> u64 {
+    std::env::var("PAPERBOT_RPC_LOG_RANGE").ok().and_then(|s| s.parse().ok()).filter(|n| *n >= 1).unwrap_or(1000)
+}
 
 #[derive(Debug, Clone)]
 pub struct Opened {
@@ -69,7 +72,7 @@ impl Chain {
             let v: Value = self.http.post(&self.rpc).json(&body).send().await?.json().await?;
             match v.get("error") {
                 None => return Ok(v["result"].clone()),
-                Some(e) if e.to_string().to_lowercase().contains("rate limit") && attempt < 5 => {
+                Some(e) if (e.to_string().to_lowercase().contains("rate limit") || e.to_string().contains("429")) && attempt < 5 => {
                     tracing::debug!(attempt, "rpc rate limited; backing off {delay}s");
                     tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                     delay *= 2;
@@ -93,9 +96,10 @@ impl Chain {
 
     async fn logs(&self, topics: Value, from: u64, to: u64) -> Result<Vec<Value>> {
         let mut out = Vec::new();
+        let range = max_range();
         let mut a = from;
         while a <= to {
-            let b = (a + MAX_RANGE - 1).min(to);
+            let b = (a + range - 1).min(to);
             let r = self
                 .call(
                     "eth_getLogs",

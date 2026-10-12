@@ -79,6 +79,7 @@ pub struct Commander {
 const COMMANDS: &[(&str, &str)] = &[
     ("status", "one-screen overview: farm, pair, account, 24h, protocol"),
     ("pair", "the open pair live: pnl per leg, net if closed, ETA to trigger"),
+    ("positions", "every open position, incl. ones the engine is not tracking"),
     ("stats", "all-time and 24h performance, per market, pace"),
     ("rate", "mint curve and measured decay"),
     ("cycles", "last cycles (/cycles 10)"),
@@ -214,7 +215,8 @@ impl Commander {
         let arg2 = it.next();
         match cmd.as_str() {
             "status" => self.status().await,
-            "pair" | "position" => self.pair().await,
+            "pair" => self.pair().await,
+            "positions" | "position" => self.positions().await,
             "stats" => self.stats(),
             "rate" => self.rate().await,
             "cycles" => self.cycles(arg.and_then(|a| a.parse().ok()).unwrap_or(5)),
@@ -388,6 +390,36 @@ impl Commander {
             money(lp), money(sp), money(net), kw * 100.0, rate * 0.98 * (-l).max(0.0), rate,
             f.position_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
         )
+    }
+
+    async fn positions(&self) -> String {
+        let st = self.state();
+        let Some(user) = st.user else { return "no session registered".into() };
+        let count = match self.api.account_row(user).await { Ok(a) => a.open_positions, Err(e) => return format!("account: {e}") };
+        let mut s = format!("📂 <b>open positions: {count}</b>\n");
+        if count == 0 {
+            return s + "none";
+        }
+        let tracked = st.in_flight.as_ref().map(|f| f.position_ids.len() as u32).unwrap_or(0);
+        if let Some(f) = st.in_flight.as_ref() {
+            let mid = self.feed.as_ref().and_then(|fd| fd.mid(&f.coin)).map(|m| m.px);
+            let n = f.margin_raw as f64 / 1e18 * f.leverage as f64;
+            for (i, id) in f.position_ids.iter().enumerate() {
+                let long = f.longs.get(i).copied().unwrap_or(i == 0);
+                let entry = f.entries.get(i).copied().unwrap_or(f.mid_at_open);
+                let pnl = mid.map(|m| (m / entry - 1.0) * n * if long { 1.0 } else { -1.0 });
+                s.push_str(&format!(
+                    "#{id} {} {} {}× · ${:.0} margin · ${:.0} notional · entry {:.2}{}\n",
+                    f.coin, if long { "LONG " } else { "SHORT" }, f.leverage, f.margin_raw as f64 / 1e18, n, entry,
+                    pnl.map(|p| format!(" · pnl {}", money(p))).unwrap_or_default()
+                ));
+            }
+            s.push_str(&format!("tracked by the engine · open {}\n", dur(crate::sign::now_secs().saturating_sub(f.opened_at))));
+        }
+        if count > tracked {
+            s.push_str(&format!("⚠️ {} position(s) NOT tracked by the engine — a running engine adopts them on its next loop; /liquidate closes everything\n", count - tracked));
+        }
+        s
     }
 
     fn stats(&self) -> String {

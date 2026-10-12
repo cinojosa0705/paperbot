@@ -72,7 +72,8 @@ same files and endpoints the bot does and never signs or posts anything; pass th
 export PAPERBOT_TG_TOKEN=123456:ABC…     # @BotFather token
 export PAPERBOT_TG_CHAT=-100…            # the group id
 export PAPERBOT_TG_USERS=111,222         # user ids allowed to issue commands (unset = anyone in the group)
-export PAPERBOT_RPC=https://…            # HyperEVM JSON-RPC (Alchemy etc.); the public node is the fallback and rate-limits log scans
+export PAPERBOT_RPC=https://…            # HyperEVM JSON-RPC; the public node rate-limits log scans
+export PAPERBOT_RPC_LOG_RANGE=10         # blocks per eth_getLogs (Alchemy free tier = 10; public node = 1000)
 ```
 
 Put them (and the state/ledger paths) in `~/.paperbot/env` and `source` it — never in the repo.
@@ -80,7 +81,7 @@ Put them (and the state/ledger paths) in `~/.paperbot/env` and `source` it — n
 **Commands** (allowlisted users only): `/status` (farm · pair · account · 24h · all-time · protocol ·
 session), `/pair` (live pnl per leg, net if closed, PAPER if closed, bust-guard distance, ETA to trigger),
 `/stats` (all-time, 24h, per market, pace, projection), `/rate` (curve + measured decay + half-life),
-`/cycles [n]`, `/health` (engine heartbeat, feed age, exchange gates, session key), `/params`,
+`/positions` (every open position with live pnl, flags untracked ones), `/cycles [n]`, `/health` (engine heartbeat, feed age, exchange gates, session key), `/params`,
 `/set <key> <value>`, `/pause`, `/resume`, `/liquidate`, `/help`.
 
 `/set` keys: `move` (%), `buffer` (%), `market` (auto|btc|eth), `capital` (0–1), `ddstop` (%),

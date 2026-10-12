@@ -46,7 +46,7 @@ pub struct RunArgs {
 
 const E18: f64 = 1e18;
 const BUST_BUFFER: f64 = 0.0005; // the contract trips liquidation ~5 bps before zero equity
-const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+const OPEN_TIMEOUT: Duration = Duration::from_secs(90);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub struct Engine {
@@ -265,7 +265,32 @@ impl Engine {
                 self.stop_note("horizon reached");
                 break;
             }
-            let balance = self.balance().await?;
+            // adopt anything open that we have no record of (a crash, a timed-out open, a manual trade)
+            let row = self.api.account_row(self.user).await?;
+            if row.open_positions > 0 {
+                let f = match self.st.in_flight.clone() {
+                    Some(f) => f,
+                    None => {
+                        tracing::warn!(open = row.open_positions, "untracked open positions; adopting from the chain log");
+                        self.notify(format!("🧷 adopting {} untracked position(s) from the chain log", row.open_positions));
+                        let latest = self.chain.block_number().await?;
+                        let adopted = self.adopt(latest.saturating_sub(900), latest).await?;
+                        if adopted.is_none() {
+                            tokio::time::sleep(Duration::from_secs(10)).await;
+                            continue;
+                        }
+                        adopted.unwrap()
+                    }
+                };
+                let pair = match self.recover(&f).await {
+                    Ok(p) => p,
+                    Err(err) => { tracing::warn!(%err, "recover failed; retrying"); tokio::time::sleep(Duration::from_secs(10)).await; continue; }
+                };
+                let td = if f.target_move > 0.0 { f.target_move } else { d };
+                self.watch_and_close(pair, td, buf).await?;
+                continue;
+            }
+            let balance = row.balance_raw;
             let dd = 1.0 - balance as f64 / start_balance as f64;
             for (i, m) in [0.25, 0.5].iter().enumerate() {
                 if dd >= *m && !dd_alerted[i] {
@@ -335,6 +360,11 @@ impl Engine {
                         tracing::warn!(%s, "open refused; retrying in 20s");
                         self.avoid = Some(coin.name);
                         tokio::time::sleep(Duration::from_secs(20)).await;
+                        continue;
+                    }
+                    if s.contains("not visible yet") {
+                        open_failures = 0;
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                         continue;
                     }
                     if open_failures >= 3 {
@@ -445,7 +475,22 @@ impl Engine {
             self.clear_in_flight()?;
             bail!("open refused ({first_side} first, nothing landed): {err}");
         }
-        if let Err(err) = self.api.post_intent(second.action, &second.body).await {
+        let mut second_res = self.api.post_intent(second.action, &second.body).await;
+        for attempt in 1..=3 {
+            match &second_res {
+                Err(err) if err.to_string().contains("admission_rejected") => {
+                    tracing::warn!(attempt, "second leg refused; retrying in 2s");
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let fresh = match second_side { "short" => OpenPosition { nonce: self.st.take_nonce(), deadline: sign::deadline(), ..short.clone() }, _ => OpenPosition { nonce: self.st.take_nonce(), deadline: sign::deadline(), ..long.clone() } };
+                    let fs = sign::sign(&self.signer, &self.domain, &fresh)?;
+                    if let Some(f) = self.st.in_flight.as_mut() { f.intent_ids = vec![first.intent_id, fs.intent_id]; }
+                    self.st.save(&self.state_path)?;
+                    second_res = self.api.post_intent(fs.action, &fs.body).await;
+                }
+                _ => break,
+            }
+        }
+        if let Err(err) = second_res {
             tracing::error!(error = %err, "second open refused; closing the first leg");
             self.notify(format!("⚠️ {} {second_side} refused ({err}) — closing the naked {first_side}", coin.name));
             self.short_first = !self.short_first;
@@ -459,6 +504,10 @@ impl Engine {
         tracing::debug!("opens accepted");
 
         let opened = self.wait_opened(from_block, 2, OPEN_TIMEOUT).await?;
+        if opened.is_empty() {
+            tracing::warn!("both opens acked but no position visible yet; keeping the record for adoption");
+            bail!("opens not visible yet");
+        }
         if opened.len() < 2 {
             tracing::error!(n = opened.len(), "naked leg: only one position landed; closing it");
             self.notify("⚠️ <b>naked leg</b>: only one position landed, closing it".to_string());
@@ -508,10 +557,33 @@ impl Engine {
         }
     }
 
+    /// Build an in-flight record for positions found on-chain but not in state (writes state.json).
+    async fn adopt(&mut self, from: u64, to: u64) -> Result<Option<InFlight>> {
+        let opened = self.chain.opened(self.user, from, to).await?;
+        let closed = self.chain.closed(self.user, from, to).await?;
+        let live: Vec<_> = opened.into_iter().filter(|o| !closed.iter().any(|c| c.position_id == o.position_id)).collect();
+        let Some(first) = live.first().cloned() else { return Ok(None) };
+        let coin = if first.instrument_id == 0 { BTC } else { ETH };
+        let same: Vec<_> = live.iter().filter(|o| o.instrument_id == first.instrument_id).cloned().collect();
+        let entries: Vec<f64> = same.iter().map(|o| o.entry_px_raw as f64 / coin.scale).collect();
+        let f = InFlight {
+            coin: coin.name.into(), instrument_id: coin.id, intent_ids: vec![],
+            position_ids: same.iter().map(|o| o.position_id).collect(),
+            entries: entries.clone(), longs: same.iter().map(|o| o.is_long).collect(),
+            target_move: self.args.move_pct / 100.0,
+            mid_at_open: entries.iter().sum::<f64>() / entries.len() as f64,
+            opened_at: sign::now_secs(), margin_raw: first.margin_raw, leverage: first.leverage,
+        };
+        self.st.in_flight = Some(f.clone());
+        self.st.save(&self.state_path)?;
+        tracing::info!(ids = ?f.position_ids, coin = f.coin, "adopted");
+        Ok(Some(f))
+    }
+
     async fn recover(&mut self, f: &InFlight) -> Result<Pair> {
         let coin = if f.instrument_id == 0 { BTC } else { ETH };
         let latest = self.chain.block_number().await?;
-        let from = latest.saturating_sub(((sign::now_secs() - f.opened_at) as u64 + 60) * 2);
+        let from = latest.saturating_sub(((sign::now_secs().saturating_sub(f.opened_at)) + 120).min(3600));
         let opened = self.chain.opened(self.user, from, latest).await?;
         let closed = self.chain.closed(self.user, from, latest).await?;
         let live: Vec<_> = opened
@@ -543,6 +615,7 @@ impl Engine {
         let mut shutdown = self.shutdown.clone();
         let mut last_move = 0.0;
         let mut liquidate = false;
+        let mut low_polls = 0u32;
         loop {
             tokio::select! {
                 _ = rx.changed() => {
@@ -567,6 +640,11 @@ impl Engine {
                     if self.args.dry_run { continue; }
                     let row = self.api.account_row(self.user).await?;
                     if row.open_positions < pair.ids.len() as u32 {
+                        low_polls += 1;
+                    } else {
+                        low_polls = 0;
+                    }
+                    if low_polls >= 2 {
                         tracing::error!(open = row.open_positions, "a leg vanished (liquidation?); closing the rest");
                         self.notify(format!("⚠️ <b>a leg vanished</b> (liquidation?) — open positions {}, closing the rest", row.open_positions));
                         break;
