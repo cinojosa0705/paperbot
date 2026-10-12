@@ -46,6 +46,8 @@ pub struct RunArgs {
 
 const E18: f64 = 1e18;
 const BUST_BUFFER: f64 = 0.0005; // the contract trips liquidation ~5 bps before zero equity
+/// target-to-bust headroom the close path needs (a close took 6.6s once while BTC moved 0.045%)
+const CLOSE_HEADROOM: f64 = 0.0010;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(90);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -183,6 +185,20 @@ impl Engine {
         Self::params_from_args(&self.args) != before
     }
 
+    /// The buffer the farm actually runs with: at least enough for the close to land before the bust.
+    fn safe_buffer(&self, d: f64, requested: f64) -> f64 {
+        let min_buf = (BUST_BUFFER + CLOSE_HEADROOM) / d;
+        if requested < min_buf {
+            let b = (min_buf * 100.0).ceil() / 100.0;
+            tracing::warn!(requested = requested * 100.0, used = b * 100.0, "buffer raised for close headroom");
+            self.notify(format!("🛡 buffer {:.0}% is too thin for a {:.2}% move — running with {:.0}% so the close lands ≥0.10% before the bust ({}×)",
+                requested * 100.0, d * 100.0, b * 100.0, ((1.0 / (d * (1.0 + b))).round() as u32).clamp(1, 1000)));
+            b
+        } else {
+            requested
+        }
+    }
+
     fn stopping(&self) -> bool {
         *self.shutdown.borrow()
     }
@@ -195,13 +211,8 @@ impl Engine {
             _ => { let _ = Self::params_from_args(&self.args).save(&pp); }
         }
         let mut d = self.args.move_pct / 100.0;
-        let mut buf = self.args.buffer_pct / 100.0;
+        let mut buf = self.safe_buffer(d, self.args.buffer_pct / 100.0);
         let mut leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
-        // the close level must sit below the bust guard, else the guard fires first
-        let min_buf = (BUST_BUFFER + 0.0003) / d;
-        if buf < min_buf {
-            bail!("buffer {:.0}% too small for a {:.2}% move: the bust trigger sits 5 bps early; use --buffer-pct {:.0} or more", buf * 100.0, d * 100.0, (min_buf * 100.0).ceil());
-        }
         let start = Instant::now();
         let start_balance = self.balance().await?;
         let mut peak = start_balance;
@@ -266,7 +277,7 @@ impl Engine {
                     }
                     if self.apply_params(&p) {
                         d = self.args.move_pct / 100.0;
-                        buf = self.args.buffer_pct / 100.0;
+                        buf = self.safe_buffer(d, self.args.buffer_pct / 100.0);
                         leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
                         floor = (peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
                         tracing::info!(params = %p.summary(), "params updated");
@@ -669,7 +680,7 @@ impl Engine {
                         tracing::info!(mid = m.px, mv = last_move, "trigger");
                         break;
                     }
-                    if last_move >= bust_move - 0.0003 {
+                    if last_move >= bust_move - 0.0008 {
                         tracing::warn!(mv = last_move, "approaching bust; closing now");
                         break;
                     }

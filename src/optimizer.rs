@@ -85,7 +85,7 @@ pub fn optimize(vols: &[(&'static str, f64)], i: &Inputs) -> Vec<Rec> {
         let mut k = 0;
         while k <= 60 {
             let d = 0.0005 * 200f64.powf(k as f64 / 60.0); // 0.05% … 10%
-            let buf = ((0.0008 / d) * 1.1).max(0.25);
+            let buf = ((0.0015 / d) * 1.05).max(0.25);
             if let Some(r) = sim(d, buf, pm, vol, i) {
                 if best.as_ref().map(|b| r.paper_total > b.paper_total).unwrap_or(true) {
                     best = Some(r);

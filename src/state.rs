@@ -114,9 +114,9 @@ impl Params {
     pub fn save(&self, path: &Path) -> Result<()> {
         std::fs::write(path, serde_json::to_string_pretty(self)?).context("write params")
     }
-    /// Minimum buffer so the voluntary close lands before the 5 bps bust trigger (+3 bps guard).
+    /// Minimum buffer so the close lands ≥0.10% before the 5 bps bust trigger (the engine enforces it too).
     pub fn min_buffer_pct(move_pct: f64) -> f64 {
-        (0.0008 / (move_pct / 100.0) * 100.0).ceil()
+        (0.0015 / (move_pct / 100.0) * 100.0).ceil()
     }
     pub fn validate(&self) -> std::result::Result<(), String> {
         if !matches!(self.market.as_str(), "auto" | "btc" | "eth") { return Err("market must be auto, btc or eth".into()); }
