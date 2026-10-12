@@ -75,6 +75,11 @@ impl Engine {
         let d = self.args.move_pct / 100.0;
         let buf = self.args.buffer_pct / 100.0;
         let leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
+        // the close level must sit below the bust guard, else the guard fires first
+        let min_buf = (BUST_BUFFER + 0.0003) / d;
+        if buf < min_buf {
+            bail!("buffer {:.0}% too small for a {:.2}% move: the bust trigger sits 5 bps early; use --buffer-pct {:.0} or more", buf * 100.0, d * 100.0, (min_buf * 100.0).ceil());
+        }
         let start = Instant::now();
         let start_balance = self.balance().await?;
         let floor = (start_balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
