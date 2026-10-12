@@ -128,8 +128,13 @@ impl Engine {
     pub async fn run(mut self) -> Result<()> {
         let r = self.run_inner().await;
         if let Err(e) = &r {
-            self.notify(format!("❌ <b>farm error</b>: {e}"));
+            // awaited: the process usually exits right after this
+            if let Some(n) = &self.notifier {
+                let _ = n.send_now(&format!("❌ <b>farm error</b>: {e}")).await;
+            }
         }
+        // let fire-and-forget notifications (stop reason, last cycle) flush before the runtime goes away
+        tokio::time::sleep(Duration::from_millis(1500)).await;
         r
     }
 

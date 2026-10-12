@@ -1,0 +1,10 @@
+{
+  "market": "btc",
+  "move_pct": 0.3,
+  "buffer_pct": 25.0,
+  "capital_fraction": 1.0,
+  "drawdown_stop_pct": 60.0,
+  "rate_floor": 10.0,
+  "max_cycles": 1,
+  "paused": false
+}
