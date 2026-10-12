@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <defs>
+    <linearGradient id="opal" x1="3" y1="3" x2="29" y2="29" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFDDEC"/>
+      <stop offset=".2" stop-color="#FFF8FC"/>
+      <stop offset=".42" stop-color="#C3D3FF"/>
+      <stop offset=".63" stop-color="#BDEBDB"/>
+      <stop offset=".82" stop-color="#DBC6FF"/>
+      <stop offset="1" stop-color="#FFDDEC"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="11" y1="7" x2="22" y2="26" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#111832"/>
+      <stop offset=".54" stop-color="#303A70"/>
+      <stop offset="1" stop-color="#5A3C68"/>
+    </linearGradient>
+    <radialGradient id="shine" cx="0" cy="0" r="1" gradientTransform="translate(10 7) rotate(48) scale(17)">
+      <stop stop-color="#FFF" stop-opacity=".9"/>
+      <stop offset=".38" stop-color="#FFF" stop-opacity=".18"/>
+      <stop offset="1" stop-color="#FFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="16" cy="16" r="15.25" fill="url(#opal)" stroke="#F5EEFF" stroke-width="1.5"/>
+  <circle cx="16" cy="16" r="14.2" fill="url(#shine)"/>
+  <path fill="url(#ink)" d="M16 4L9 16.22l7 3.13 7-3.13L16 4zm0 17.97L9 17.62 16 28l7-10.38-7 4.35z"/>
+  <path d="M16 4v15.35l7-3.13L16 4z" fill="#6571A9" fill-opacity=".42"/>
+  <path d="M6.2 11.5c2.5-4.7 8.1-7.2 13.3-5.7" fill="none" stroke="#FFF" stroke-opacity=".72" stroke-width="1" stroke-linecap="round"/>
+</svg>

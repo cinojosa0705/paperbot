@@ -1,9 +1,4 @@
-mod api;
-mod engine;
-mod feed;
-mod positions;
-mod sign;
-mod state;
+use paperbot::{api, engine, feed, positions, sign, state, RunArgs, CHAIN_ID, EXCHANGE};
 
 use alloy::primitives::Address;
 use alloy::signers::local::PrivateKeySigner;
@@ -12,8 +7,6 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-pub const CHAIN_ID: u64 = 999;
-pub const EXCHANGE: &str = "0x6cd5661646289fb6e65ea5c032310fded797d0a2";
 
 #[derive(Parser)]
 #[command(name = "paperbot", about = "Hedged-pair PAPER farm on papertrade")]
@@ -47,33 +40,6 @@ enum Cmd {
     CloseAll,
 }
 
-#[derive(clap::Parser, Debug, Clone)]
-pub struct RunArgs {
-    /// btc | eth | auto
-    #[arg(long, default_value = "auto")]
-    pub market: String,
-    /// Move harvested per cycle, in percent.
-    #[arg(long = "move", default_value_t = 0.5)]
-    pub move_pct: f64,
-    /// Margin buffer past the move, in percent.
-    #[arg(long, default_value_t = 25.0)]
-    pub buffer_pct: f64,
-    #[arg(long, default_value_t = 1.0)]
-    pub capital_fraction: f64,
-    #[arg(long, default_value_t = 60.0)]
-    pub drawdown_stop_pct: f64,
-    #[arg(long, default_value_t = 10.0)]
-    pub rate_floor: f64,
-    #[arg(long)]
-    pub max_cycles: Option<u64>,
-    #[arg(long, default_value_t = 14.0)]
-    pub horizon_days: f64,
-    /// Abort a pair whose two entries differ by more than this, in bps.
-    #[arg(long, default_value_t = 5.0)]
-    pub max_entry_gap_bps: f64,
-    #[arg(long)]
-    pub dry_run: bool,
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {

@@ -51,6 +51,12 @@ pub struct Feed {
     samples: Arc<Mutex<Samples>>,
 }
 
+impl std::fmt::Debug for Feed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Feed")
+    }
+}
+
 impl Feed {
     pub fn spawn() -> Self {
         let mids: HashMap<String, watch::Sender<Option<Mid>>> = COINS
