@@ -137,7 +137,11 @@ async fn main() -> Result<()> {
             if cmd.trim_start_matches('/') == "calculate" {
                 if let Some((t, b, _)) = c.calculate(false).await { println!("{t}\nbuttons: {:?}", b.iter().map(|x| &x.0).collect::<Vec<_>>()); }
             } else {
-                println!("{}", c.handle(&format!("/{}", cmd.trim_start_matches('/')), "0", "cli").await);
+                let cmd = format!("/{}", cmd.trim_start_matches('/'));
+                println!("{}", c.handle(&cmd, "0", "cli").await);
+                if let Ok(out) = std::env::var("PAPERBOT_CARD_OUT") {
+                    if let Some(card) = c.card_for(&cmd).await { std::fs::write(&out, paperbot::card::render(&card)?)?; println!("card → {out}"); }
+                }
             }
         }
     }

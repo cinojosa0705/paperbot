@@ -2,3 +2,5 @@ target/
 state.json
 state.json.tmp
 ledger.jsonl
+heartbeat
+params.json

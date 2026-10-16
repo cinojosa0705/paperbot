@@ -60,7 +60,7 @@ fn hex_u64(v: &Value) -> u64 {
 impl Chain {
     pub fn new(rpc: &str) -> Result<Self> {
         Ok(Self {
-            http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)).build()?,
+            http: reqwest::Client::builder().http1_only().local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).timeout(std::time::Duration::from_secs(15)).build()?,
             rpc: rpc.to_string(),
         })
     }

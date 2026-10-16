@@ -5,11 +5,12 @@ use crate::feed::Feed;
 use crate::notify::{dur as fdur, money as fmoney, paper as fpaper, Notifier};
 use crate::positions::Chain;
 use crate::sign::{self, Close, Intent, OpenPosition};
-use crate::state::{heartbeat_touch, ledger_append, InFlight, Params, State};
+use crate::state::{heartbeat_touch, ledger_append, ledger_rewrite, ledger_rows, InFlight, Params, State};
 use alloy::primitives::{Address, U256};
 use alloy::signers::local::PrivateKeySigner;
 use alloy::sol_types::Eip712Domain;
 use anyhow::{anyhow, bail, Context, Result};
+use std::collections::HashMap;
 use serde_json::json;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -31,6 +32,9 @@ pub struct RunArgs {
     pub capital_fraction: f64,
     #[arg(long, default_value_t = 60.0)]
     pub drawdown_stop_pct: f64,
+    /// Stop when equity is at or below this many dollars (0 = off).
+    #[arg(long, default_value_t = 0.0)]
+    pub min_balance_usd: f64,
     #[arg(long, default_value_t = 10.0)]
     pub rate_floor: f64,
     #[arg(long)]
@@ -52,8 +56,19 @@ pub const CLOSE_HEADROOM: f64 = 0.0010;
 pub fn min_buffer(d: f64) -> f64 {
     (BUST_BUFFER + CLOSE_HEADROOM) / d
 }
+/// The relayer has sat on an accepted close for 146 s and on accepted opens for ~270 s; size every
+/// pair as if a close could take at least this long.
+const RELAYER_LAG_FLOOR_S: u64 = 300;
+/// Days of 1-minute candles the tail gap is measured over.
+const TAIL_DAYS: u64 = 7;
+/// the move is never shrunk below this: under 0.1% the winner's keep collapses and a cycle mints little
+const MIN_MOVE: f64 = 0.0010;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(90);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long we keep watching a close the relayer has queued but not executed (a backlog took 146 s once).
+const CLOSE_PENDING_MAX: Duration = Duration::from_secs(600);
+/// sign::deadline() is now + 1 h; an acked open can execute any time before that.
+const OPEN_INTENT_TTL: u64 = 3600 + 60;
 
 pub struct Engine {
     pub api: Api,
@@ -72,6 +87,10 @@ pub struct Engine {
     pub short_first: bool,
     /// in auto mode, skip this coin on the next pick after an admission refusal
     pub avoid: Option<&'static str>,
+    /// set by the supervisor after a failure: skip the start banner on the restart
+    pub restarted: bool,
+    /// per coin: when it was measured and the worst adverse move over the relayer-lag window
+    pub gaps: HashMap<&'static str, (Instant, f64)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -122,7 +141,7 @@ impl Engine {
         }
         let signer = PrivateKeySigner::from_str(&key).context("session key")?;
         let domain = sign::exchange_domain(crate::CHAIN_ID, Address::from_str(crate::EXCHANGE)?);
-        Ok(Engine { api, chain, feed, signer, user, domain, args, state_path, ledger_path, st, shutdown, notifier: Notifier::from_env(), short_first: false, avoid: None })
+        Ok(Engine { api, chain, feed, signer, user, domain, args, state_path, ledger_path, st, shutdown, notifier: Notifier::from_env(), short_first: false, avoid: None, restarted: false, gaps: HashMap::new() })
     }
 
     fn notify(&self, s: impl Into<String>) {
@@ -130,18 +149,40 @@ impl Engine {
             n.send(s.into());
         }
     }
-    fn stop_note(&self, why: &str) {
-        tracing::info!(why, "stopping");
-        self.notify(format!("🛑 <b>Farm stopped</b> · {why}"));
+    /// Alerts that must not be lost to a network blip: retried for ~2 minutes.
+    fn notify_critical(&self, s: impl Into<String>) {
+        if let Some(n) = &self.notifier {
+            n.send_critical(s.into());
+        }
+    }
+    /// A stop condition pauses the farm (reason shown in /status) instead of exiting: under launchd
+    /// an exit is a restart with a fresh peak and no memory of why it stopped.
+    fn pause_with(&self, why: &str) {
+        tracing::warn!(why, "pausing");
+        let pp = self.params_path();
+        let mut p = Params::load(&pp).unwrap_or_else(|| Self::params_from_args(&self.args));
+        p.pause(why);
+        let _ = p.save(&pp);
     }
 
     /// Supervised: a transient failure never ends the farm; an open pair is resumed, not abandoned.
     pub async fn run(mut self) -> Result<()> {
+        // liveness for the responder's watchdog: beats as long as the process is alive, whatever
+        // the loop is waiting on (a relayer close can take 7 minutes)
+        let hb_path = self.state_path.clone();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                heartbeat_touch(&hb_path);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
         let mut failures = 0u32;
+        let mut last_error_alert = 0u64;
         loop {
             match self.run_inner().await {
                 Ok(()) => {
                     tokio::time::sleep(Duration::from_millis(1500)).await;
+                    heartbeat.abort();
                     return Ok(());
                 }
                 Err(e) => {
@@ -152,13 +193,17 @@ impl Engine {
                             let _ = n.send_now(&format!("❌ <b>Farm error</b> (giving up)\n{e}")).await;
                         }
                         tokio::time::sleep(Duration::from_millis(1500)).await;
+                        heartbeat.abort();
                         return Err(e);
                     }
                     tracing::error!(error = %e, failures, "engine error; restarting the loop in 10s");
-                    if failures == 1 || failures % 10 == 0 {
+                    let now = sign::now_secs();
+                    if now.saturating_sub(last_error_alert) >= 600 {
+                        last_error_alert = now;
                         self.notify(format!("⚠️ <b>Engine error #{failures}</b> — resuming in 10s (open pair is kept)\n{e}"));
                     }
                     tokio::time::sleep(Duration::from_secs(10)).await;
+                    self.restarted = true;
                     if let Ok(st) = State::load(&self.state_path) {
                         self.st = st;
                     }
@@ -173,7 +218,7 @@ impl Engine {
     pub fn params_from_args(a: &RunArgs) -> Params {
         Params {
             market: a.market.clone(), move_pct: a.move_pct, buffer_pct: a.buffer_pct, capital_fraction: a.capital_fraction,
-            drawdown_stop_pct: a.drawdown_stop_pct, rate_floor: a.rate_floor, max_cycles: a.max_cycles, paused: false, liquidate: false,
+            drawdown_stop_pct: a.drawdown_stop_pct, min_balance_usd: a.min_balance_usd, rate_floor: a.rate_floor, max_cycles: a.max_cycles, paused: false, liquidate: false, pause_reason: None, paused_at: None,
         }
     }
     /// Overlay live params onto the run args; true if anything changed.
@@ -184,9 +229,16 @@ impl Engine {
         self.args.buffer_pct = p.buffer_pct;
         self.args.capital_fraction = p.capital_fraction;
         self.args.drawdown_stop_pct = p.drawdown_stop_pct;
+        self.args.min_balance_usd = p.min_balance_usd;
         self.args.rate_floor = p.rate_floor;
         self.args.max_cycles = p.max_cycles;
         Self::params_from_args(&self.args) != before
+    }
+
+    /// Stop floor: the higher of the peak drawdown stop and the hard dollar floor.
+    fn stop_floor(&self, peak: u128) -> u128 {
+        let dd = peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0);
+        dd.max(self.args.min_balance_usd * E18) as u128
     }
 
     /// The buffer the farm actually runs with: at least enough for the close to land before the bust.
@@ -201,6 +253,27 @@ impl Engine {
         } else {
             requested
         }
+    }
+
+    /// Trigger-to-bust headroom a pair on `coin` needs: the worst adverse move over the last TAIL_DAYS
+    /// in a window as long as the slowest close we have seen (never under RELAYER_LAG_FLOOR_S).
+    async fn tail_gap(&mut self, coin: &'static str) -> Result<f64> {
+        if let Some((at, g)) = self.gaps.get(coin) {
+            if at.elapsed() < Duration::from_secs(3600) { return Ok(*g); }
+        }
+        let window = self.st.worst_close_s.max(RELAYER_LAG_FLOOR_S).min(CLOSE_PENDING_MAX.as_secs());
+        let g = self.api.worst_move(coin, window, TAIL_DAYS).await?.max(CLOSE_HEADROOM);
+        tracing::info!(coin, window_s = window, gap = g * 100.0, "tail gap measured");
+        self.gaps.insert(coin, (Instant::now(), g));
+        Ok(g)
+    }
+
+    /// Leverage for a pair on `coin`: the configured one, capped so the bust sits `gap` past the trigger.
+    async fn pair_leverage(&mut self, coin: &'static str, d: f64, configured: u32) -> Result<(u32, f64)> {
+        let gap = self.tail_gap(coin).await?;
+        let cap = ((1.0 / (d + gap + BUST_BUFFER)).floor() as u32).clamp(1, 1000);
+        let lev = configured.min(cap);
+        Ok((lev, 1.0 / (d * lev as f64) - 1.0))
     }
 
     fn stopping(&self) -> bool {
@@ -219,24 +292,25 @@ impl Engine {
         let mut leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
         let start = Instant::now();
         let start_balance = self.balance().await?;
-        let mut peak = start_balance;
-        let mut floor = (peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
+        let mut peak = start_balance.max(self.st.peak_equity);
+        if peak > self.st.peak_equity { self.st.peak_equity = peak; self.st.save(&self.state_path)?; }
+        let mut floor = self.stop_floor(peak);
         tracing::info!(
             balance = start_balance as f64 / E18, leverage, move = d, floor = floor as f64 / E18,
             dry_run = self.args.dry_run, "paperbot starting"
         );
-        self.notify(format!(
-            "🧻 <b>UwU bot started</b>{}\n<code>equity       </code>{}\n<code>strategy     </code>{} · {:.2}% move · {}× · buffer {:.0}%\n<code>stop         </code>−{:.0}% from peak ({})",
+        if !self.restarted { self.notify(format!(
+            "🧻 <b>UwU bot started</b>{}\n<code>equity       </code>{}\n<code>strategy     </code>{} · {:.2}% move · {}× · buffer {:.0}%\n<code>stop         </code>−{:.0}% from peak{} ({})",
             if self.args.dry_run { " (dry run)" } else { "" }, fmoney(start_balance as f64 / E18), self.args.market, d * 100.0, leverage,
-            buf * 100.0, self.args.drawdown_stop_pct, fmoney(floor as f64 / E18)
-        ));
+            buf * 100.0, self.args.drawdown_stop_pct, if self.args.min_balance_usd > 0.0 { format!(" or ${:.0}", self.args.min_balance_usd) } else { String::new() }, fmoney(floor as f64 / E18)
+        )); }
 
         // crash recovery: a pair we opened and never closed
         if let Some(f) = self.st.in_flight.clone() {
             tracing::warn!(ids = ?f.position_ids, "resuming an in-flight pair");
             let pair = self.recover(&f).await?;
             let td = if f.target_move > 0.0 { f.target_move } else { d };
-            self.watch_and_close(pair, td, buf).await?;
+            self.watch_and_close(pair, td).await?;
         }
 
         if let Some(exp) = self.st.session_expiry {
@@ -249,15 +323,29 @@ impl Engine {
         let (mut paused_logged, mut bad_params_logged) = (false, false);
         let mut open_failures = 0u32;
         let mut size_logged = false;
+        let mut pending_logged = false;
+        let mut pending_next_note: u64 = 0;
         let mut dd_alerted = [false, false];
         loop {
-            heartbeat_touch(&self.state_path);
             if self.stopping() {
-                self.stop_note("stop requested");
+                tracing::info!("stop requested");
                 break;
             }
             // live params take effect here, i.e. at the next pair — never under an open one
-            if let Some(p) = Params::load(&pp) {
+            if let Some(mut p) = Params::load(&pp) {
+                // pause / liquidate are honoured no matter what the strategy numbers say
+                if p.paused {
+                    if !paused_logged {
+                        tracing::info!(reason = p.pause_reason.as_deref().unwrap_or(""), "paused");
+                        self.notify_critical(format!("⏸ <b>Farm paused</b>{} — no new pairs until /resume",
+                            p.pause_reason.as_deref().map(|r| format!(" · {r}")).unwrap_or_default()));
+                        paused_logged = true;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+                // a buffer below the headroom rule is raised by safe_buffer, not a reason to ignore the file
+                p.buffer_pct = p.buffer_pct.max(Params::min_buffer_pct(p.move_pct));
                 if let Err(err) = p.validate() {
                     if !bad_params_logged {
                         tracing::warn!(%err, "ignoring invalid params.json");
@@ -266,15 +354,6 @@ impl Engine {
                     }
                 } else {
                     bad_params_logged = false;
-                    if p.paused {
-                        if !paused_logged {
-                            tracing::info!("paused");
-                            self.notify("⏸ <b>paused</b> — no new pairs until /resume".to_string());
-                            paused_logged = true;
-                        }
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        continue;
-                    }
                     if paused_logged {
                         self.notify("▶️ resumed".to_string());
                         paused_logged = false;
@@ -283,7 +362,7 @@ impl Engine {
                         d = self.args.move_pct / 100.0;
                         buf = self.safe_buffer(d, self.args.buffer_pct / 100.0);
                         leverage = ((1.0 / (d * (1.0 + buf))).round() as u32).clamp(1, 1000);
-                        floor = (peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
+                        floor = self.stop_floor(peak);
                         tracing::info!(params = %p.summary(), "params updated");
                         self.notify(format!("🔧 <b>Params applied</b>\n{}", p.summary()));
                     }
@@ -291,17 +370,48 @@ impl Engine {
             }
             if let Some(max) = self.args.max_cycles {
                 if self.st.cycles_done >= max {
-                    self.stop_note("max cycles reached");
-                    break;
+                    self.pause_with(&format!("max cycles ({max}) reached"));
+                    continue;
                 }
             }
             let elapsed_days = start.elapsed().as_secs_f64() / 86_400.0;
             if elapsed_days >= self.args.horizon_days {
-                self.stop_note("horizon reached");
-                break;
+                self.pause_with("horizon reached");
+                continue;
+            }
+            self.backfill().await;
+            let row = self.api.account_row(self.user).await?;
+            // opens the relayer acked but has not executed yet: wait for them, never fire more
+            if let Some(f) = self.st.in_flight.clone().filter(|f| f.position_ids.is_empty()) {
+                let age = sign::now_secs().saturating_sub(f.opened_at);
+                if row.open_positions == 0 {
+                    // the relayer has executed acked opens 17 min late; they stay valid until the
+                    // intent deadline (1 h), so only then is "never landed" true
+                    if age > OPEN_INTENT_TTL {
+                        tracing::warn!(age, "pending opens past their deadline; dropping the record");
+                        self.notify(format!("⚠️ opens pending at the relayer for {} are past their 1 h deadline — record dropped, will reopen", fdur(age)));
+                        self.clear_in_flight()?;
+                        pending_logged = false;
+                    } else {
+                        if (!pending_logged && age > 30) || (pending_logged && age >= pending_next_note) {
+                            let q = self.api.queued(self.user).await.unwrap_or(0);
+                            tracing::warn!(age, queued = q, "opens pending at the relayer; not reopening");
+                            let qs = if q > 0 { format!(" ({q} in the queue)") } else { String::new() };
+                            self.notify(format!("⏳ <b>opens queued at the relayer</b> for {}{qs} — margin held, waiting; I adopt them when they land", fdur(age)));
+                            pending_logged = true;
+                            pending_next_note = age + 600;
+                        }
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                } else {
+                    tracing::info!(age, open = row.open_positions, "pending opens landed");
+                    self.st.worst_close_s = self.st.worst_close_s.max(age);
+                    if pending_logged { self.notify(format!("🟢 pending opens landed after {} — watching the pair", fdur(age))); }
+                    pending_logged = false;
+                }
             }
             // adopt anything open that we have no record of (a crash, a timed-out open, a manual trade)
-            let row = self.api.account_row(self.user).await?;
             if row.open_positions > 0 {
                 let f = match self.st.in_flight.clone() {
                     Some(f) => f,
@@ -322,35 +432,37 @@ impl Engine {
                     Err(err) => { tracing::warn!(%err, "recover failed; retrying"); tokio::time::sleep(Duration::from_secs(10)).await; continue; }
                 };
                 let td = if f.target_move > 0.0 { f.target_move } else { d };
-                self.watch_and_close(pair, td, buf).await?;
+                self.watch_and_close(pair, td).await?;
                 continue;
             }
             let balance = self.equity(&row);
             if balance > peak {
                 if balance as f64 > peak as f64 * 1.1 {
                     self.notify(format!("💰 <b>Deposit detected</b>\nequity {} (was {}) · drawdown stop now {}",
-                        fmoney(balance as f64 / E18), fmoney(peak as f64 / E18), fmoney(balance as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0) / E18)));
+                        fmoney(balance as f64 / E18), fmoney(peak as f64 / E18), fmoney(self.stop_floor(balance) as f64 / E18)));
                 }
                 peak = balance;
-                floor = (peak as f64 * (1.0 - self.args.drawdown_stop_pct / 100.0)) as u128;
+                floor = self.stop_floor(peak);
                 dd_alerted = [false, false];
+                self.st.peak_equity = peak;
+                let _ = self.st.save(&self.state_path);
             }
             let dd = 1.0 - balance as f64 / peak as f64;
             for (i, m) in [0.25, 0.5].iter().enumerate() {
                 if dd >= *m && !dd_alerted[i] {
                     dd_alerted[i] = true;
-                    self.notify(format!("📉 <b>Drawdown {:.0}%</b>\nequity {} from peak {} · stop at {}", dd * 100.0, fmoney(balance as f64 / E18), fmoney(peak as f64 / E18), fmoney(floor as f64 / E18)));
+                    self.notify_critical(format!("📉 <b>Drawdown {:.0}%</b>\nequity {} from peak {} · stop at {}", dd * 100.0, fmoney(balance as f64 / E18), fmoney(peak as f64 / E18), fmoney(floor as f64 / E18)));
                 }
             }
             if balance <= floor {
-                self.stop_note(&format!("drawdown stop at ${:.2}", balance as f64 / E18));
-                break;
+                self.pause_with(&format!("{} at ${:.2}", if (balance as f64) <= self.args.min_balance_usd * E18 { "min balance floor" } else { "drawdown stop" }, balance as f64 / E18));
+                continue;
             }
             let summary = self.api.summary().await?;
             let rate = summary.mint_rate();
             if rate < self.args.rate_floor {
-                self.stop_note(&format!("mint rate {rate:.1} below floor"));
-                break;
+                self.pause_with(&format!("mint rate {rate:.1} below the {:.1} floor", self.args.rate_floor));
+                continue;
             }
             let ts = self.api.trading_state().await?;
             if ts.trading_paused || ts.action_paused("openPosition") || ts.action_paused("closePositions") {
@@ -369,8 +481,16 @@ impl Engine {
                 continue;
             };
             stale_logged = false;
-            let margin_raw = match self.size(&ts, row.balance_raw, leverage) {
-                Ok(m) => m,
+            let (leverage, buf) = match self.pair_leverage(coin.name, d, leverage).await {
+                Ok(lb) => lb,
+                Err(err) => {
+                    tracing::warn!(%err, "no tail gap; not opening");
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    continue;
+                }
+            };
+            let (leverage, d_eff, margin_raw) = match self.size_or_shrink(&ts, row.balance_raw, coin.name, d, leverage).await {
+                Ok(x) => x,
                 Err(err) => {
                     // config can't open a pair on this balance: say so, keep waiting for /set
                     if !size_logged {
@@ -389,17 +509,22 @@ impl Engine {
                 margin = margin_raw as f64 / E18, leverage, mid = mid.px, "opening pair"
             );
 
-            let pair = match self.open_pair(coin, margin_raw, leverage, mid.px).await {
+            let pair = match self.open_pair(coin, margin_raw, leverage, d_eff, mid.px).await {
                 Ok(p) => p,
                 Err(err) => {
                     let s = err.to_string();
                     open_failures += 1;
                     if s.contains("admission_rejected") {
-                        if open_failures == 1 || open_failures % 15 == 0 {
-                            self.notify(format!(
-                                "⚠️ open refused on {} — {s}\nretrying every 20s{}", coin.name,
-                                if self.args.market == "auto" { ", alternating markets" } else { "" }
-                            ));
+                        // first refusal, then once every 30 min; a "funding" refusal with nothing open
+                        // means the relayer is holding margin for opens we no longer track
+                        if open_failures == 1 || open_failures % 90 == 0 {
+                            let q = self.api.queued(self.user).await.unwrap_or(0);
+                            self.notify(if s.contains("\"funding\"") {
+                                format!("⏳ {} open refused: margin held by opens queued at the relayer{} — waiting, I adopt them when they land", coin.name, if q > 0 { format!(" ({q} in the queue)") } else { String::new() })
+                            } else {
+                                format!("⚠️ open refused on {} — {s}\nretrying every 20s{}", coin.name,
+                                    if self.args.market == "auto" || self.args.market.ends_with('+') { ", alternating markets" } else { "" })
+                            });
                         }
                         tracing::warn!(%s, "open refused; retrying in 20s");
                         self.avoid = Some(coin.name);
@@ -421,7 +546,7 @@ impl Engine {
             };
             open_failures = 0;
             self.avoid = None;
-            self.watch_and_close(pair, d, buf).await?;
+            self.watch_and_close(pair, d_eff).await?;
         }
         Ok(())
     }
@@ -434,6 +559,24 @@ impl Engine {
     async fn balance(&self) -> Result<u128> {
         let row = self.api.account_row(self.user).await?;
         Ok(self.equity(&row))
+    }
+
+    /// Size at the configured move. When the notional floor is out of reach at the tail-capped
+    /// leverage, shrink the move instead of idling: a smaller move leaves room for more leverage,
+    /// and the minimum margin per leg falls with it. Never below MIN_MOVE.
+    async fn size_or_shrink(&mut self, ts: &TradingState, balance: u128, coin: &'static str, d: f64, leverage: u32) -> Result<(u32, f64, u128)> {
+        let first = self.size(ts, balance, leverage);
+        if let Ok(m) = first { return Ok((leverage, d, m)); }
+        let per_leg = (balance as f64 * self.args.capital_fraction / 2.0 / E18).floor() * E18;
+        let need = (ts.min_open_notional_raw as f64 / per_leg.max(E18)).ceil() as u32;
+        if need <= leverage || need > 1000 { return first.map(|m| (leverage, d, m)); }
+        let d2 = (1.0 / need as f64 - self.tail_gap(coin).await? - BUST_BUFFER).min(d);
+        if d2 < MIN_MOVE { return first.map(|m| (leverage, d, m)); }
+        let m = self.size(ts, balance, need)?;
+        tracing::warn!(coin, need, d2 = d2 * 100.0, "move shrunk to clear the notional floor");
+        self.notify(format!("📉 <b>move shrunk</b> to {:.2}% at {need}× on {coin}: ${:.0} per leg needs ≥ {need}× for the ${:.0} notional floor",
+            d2 * 100.0, per_leg / E18, ts.min_open_notional_raw as f64 / E18));
+        Ok((need, d2, m))
     }
 
     fn size(&self, ts: &TradingState, balance: u128, leverage: u32) -> Result<u128> {
@@ -456,9 +599,14 @@ impl Engine {
 
     /// Price one cycle on each coin against both remaining budgets; cheaper market wins.
     fn pick_coin(&self, d: f64, balance: u128, floor: u128, days_left: f64) -> Coin {
-        match self.args.market.as_str() {
-            "btc" => return BTC,
-            "eth" => return ETH,
+        let (market, fallback) = match self.args.market.strip_suffix('+') { Some(m) => (m, true), None => (self.args.market.as_str(), false) };
+        let other = |c: Coin| if c.name == "BTC" { ETH } else { BTC };
+        match market {
+            "btc" | "eth" => {
+                let c = if market == "btc" { BTC } else { ETH };
+                // "+": the relayer refused this market on the last try, take the other one for this pair
+                return if fallback && self.avoid == Some(c.name) { other(c) } else { c };
+            }
             _ => {}
         }
         let rem_cap = (balance.saturating_sub(floor)) as f64 / E18;
@@ -489,7 +637,7 @@ impl Engine {
         Ok(signed)
     }
 
-    async fn open_pair(&mut self, coin: Coin, margin_raw: u128, leverage: u32, mid: f64) -> Result<Pair> {
+    async fn open_pair(&mut self, coin: Coin, margin_raw: u128, leverage: u32, d: f64, mid: f64) -> Result<Pair> {
         let from_block = self.chain.block_number().await?.saturating_sub(2);
         let mk = |is_long: bool, nonce: U256| OpenPosition {
             user: self.user,
@@ -508,7 +656,7 @@ impl Engine {
         let s2 = sign::sign(&self.signer, &self.domain, &short)?;
         self.st.in_flight = Some(InFlight {
             coin: coin.name.into(), instrument_id: coin.id,
-            intent_ids: vec![s1.intent_id, s2.intent_id], position_ids: vec![], entries: vec![], longs: vec![], target_move: self.args.move_pct / 100.0,
+            intent_ids: vec![s1.intent_id, s2.intent_id], position_ids: vec![], entries: vec![], longs: vec![], target_move: d,
             mid_at_open: mid, opened_at: sign::now_secs(), margin_raw, leverage,
         });
         self.st.save(&self.state_path)?;
@@ -583,7 +731,7 @@ impl Engine {
             self.notify(format!(
                 "🟢 <b>Pair open · {} · {}×</b>\n<code>margin       </code>{} per leg · {} per side\n<code>entries      </code>{:.1} / {:.1} · gap {:.1} bps\n<code>target       </code>{:.2}% · bust guard {:.3}%\n<code>at target    </code>~{} PAPER for {} (keeps {:.1}%)\n<code>ids          </code>{}",
                 coin.name, leverage, fmoney(margin_raw as f64 / E18), fmoney(n), entries[0], entries[1], gap_bps,
-                d * 100.0, (d * (1.0 + self.args.buffer_pct / 100.0) - BUST_BUFFER) * 100.0,
+                d * 100.0, (1.0 / leverage as f64 - BUST_BUFFER) * 100.0,
                 fpaper(rate * 0.98 * d * n), fmoney((1.0 - keep) * d * n), keep * 100.0,
                 ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")
             ));
@@ -648,15 +796,30 @@ impl Engine {
             .into_iter()
             .filter(|o| o.instrument_id == f.instrument_id && !closed.iter().any(|c| c.position_id == o.position_id))
             .collect();
+        if live.is_empty() && !f.position_ids.is_empty() && f.entries.len() == f.position_ids.len() {
+            // older than the log window we scan: the record is the truth unless a close shows up
+            let row = self.api.account_row(self.user).await?;
+            if row.open_notional_usd > 0.0 && !closed.iter().any(|c| f.position_ids.contains(&c.position_id)) {
+                tracing::warn!(ids = ?f.position_ids, "pair older than the log window; trusting the record");
+                return Ok(Pair { coin, ids: f.position_ids.clone(), entries: f.entries.clone(), margin_raw: f.margin_raw, leverage: f.leverage, opened_at: Instant::now(), mid_open: f.mid_at_open });
+            }
+        }
         if live.is_empty() {
             tracing::info!("in-flight pair already closed");
             self.clear_in_flight()?;
             bail!("nothing to recover");
         }
         if let Some(x) = self.st.in_flight.as_mut() {
+            x.position_ids = live.iter().map(|o| o.position_id).collect();
             x.entries = live.iter().map(|o| o.entry_px_raw as f64 / coin.scale).collect();
             x.longs = live.iter().map(|o| o.is_long).collect();
         }
+        // on disk too: a restart more than an hour later trusts the record, not the log window
+        self.st.save(&self.state_path)?;
+        let ids: Vec<String> = live.iter().map(|o| o.position_id.to_string()).collect();
+        let entries: Vec<f64> = live.iter().map(|o| o.entry_px_raw as f64 / coin.scale).collect();
+        tracing::info!(?ids, ?entries, "pair recovered; watching");
+        self.notify(format!("🧷 pair recovered: {} {}× ids {} entries {} — watching", coin.name, f.leverage, ids.join(", "), entries.iter().map(|e| format!("{e}")).collect::<Vec<_>>().join(", ")));
         Ok(Pair {
             coin,
             ids: live.iter().map(|o| o.position_id).collect(),
@@ -665,9 +828,9 @@ impl Engine {
         })
     }
 
-    async fn watch_and_close(&mut self, pair: Pair, d: f64, buf: f64) -> Result<()> {
+    async fn watch_and_close(&mut self, pair: Pair, d: f64) -> Result<()> {
         let entry = pair.entries.iter().sum::<f64>() / pair.entries.len() as f64;
-        let bust_move = d * (1.0 + buf) - BUST_BUFFER;
+        let bust_move = 1.0 / pair.leverage as f64 - BUST_BUFFER;
         let mut rx = self.feed.subscribe(pair.coin.name);
         let mut poll = tokio::time::interval(Duration::from_secs(1));
         let mut shutdown = self.shutdown.clone();
@@ -675,28 +838,70 @@ impl Engine {
         let mut liquidate = false;
         let mut low_polls = 0u32;
         let mut poll_errs = 0u32;
+        let mut ticks = 0u64;
+        let mut stale_ticks = 0u32;
+        // chain-log liquidation detector: PositionClosed for one of our ids is the truth
+        let mut scanned = self.chain.block_number().await.unwrap_or(0);
+        let hit = |mv: f64| -> Option<&'static str> {
+            if mv >= d { Some("trigger") } else if mv >= bust_move - 0.0008 { Some("approaching bust; closing now") } else { None }
+        };
         loop {
             tokio::select! {
                 _ = rx.changed() => {
                     let Some(m) = *rx.borrow() else { continue };
                     last_move = (m.px / entry - 1.0).abs();
-                    if last_move >= d {
-                        tracing::info!(mid = m.px, mv = last_move, "trigger");
-                        break;
-                    }
-                    if last_move >= bust_move - 0.0008 {
-                        tracing::warn!(mv = last_move, "approaching bust; closing now");
+                    if let Some(why) = hit(last_move) {
+                        tracing::info!(mid = m.px, mv = last_move, why);
                         break;
                     }
                 }
                 _ = poll.tick() => {
-                    heartbeat_touch(&self.state_path);
+                    ticks += 1;
                     if Params::load(&Params::path(&self.state_path)).map(|p| p.liquidate).unwrap_or(false) {
                         tracing::warn!("liquidate requested; closing the pair");
                         liquidate = true;
                         break;
                     }
                     if self.args.dry_run { continue; }
+                    // feed silent: the REST mid stands in so a bust can never go unseen
+                    let stale = self.feed.mid(pair.coin.name).map(|m| m.age() > Duration::from_secs(5)).unwrap_or(true);
+                    if stale {
+                        stale_ticks += 1;
+                        if let Ok(px) = self.api.rest_mid(pair.coin.name).await {
+                            last_move = (px / entry - 1.0).abs();
+                            if let Some(why) = hit(last_move) {
+                                tracing::warn!(px, mv = last_move, why, "feed stale; REST price");
+                                break;
+                            }
+                        }
+                        if stale_ticks == 30 {
+                            tracing::warn!("price feed silent for 30s under an open pair; watching via REST");
+                            self.notify("⚠️ price feed silent for 30s under an open pair — watching via the REST mid".to_string());
+                        }
+                    } else if stale_ticks > 0 {
+                        if stale_ticks >= 30 { self.notify("🟢 price feed back".to_string()); }
+                        stale_ticks = 0;
+                    }
+                    if ticks % 5 == 0 {
+                        if let Ok(latest) = self.chain.block_number().await {
+                            if latest > scanned {
+                                if let Ok(closed) = self.chain.closed(self.user, scanned + 1, latest).await {
+                                    let gone = closed.iter().filter(|c| pair.ids.contains(&c.position_id)).count();
+                                    if gone >= pair.ids.len() {
+                                        // our own close from before a restart landed; reconcile, no alarm
+                                        tracing::info!("both legs closed on chain; reconciling");
+                                        break;
+                                    }
+                                    if gone > 0 {
+                                        tracing::error!("a leg closed on chain (liquidation?); closing the rest");
+                                        self.notify_critical("⚠️ <b>a leg closed on chain</b> (liquidation?) — closing the rest".to_string());
+                                        break;
+                                    }
+                                    scanned = latest;
+                                }
+                            }
+                        }
+                    }
                     let row = match self.api.account_row(self.user).await {
                         Ok(r) => { poll_errs = 0; r }
                         Err(err) => {
@@ -708,14 +913,17 @@ impl Engine {
                             continue;
                         }
                     };
-                    if row.open_positions < pair.ids.len() as u32 {
+                    let open = if row.open_count_exact { row.open_positions } else {
+                        (row.open_notional_usd / (pair.margin_raw as f64 / E18 * pair.leverage as f64)).round() as u32
+                    };
+                    if open < pair.ids.len() as u32 {
                         low_polls += 1;
                     } else {
                         low_polls = 0;
                     }
                     if low_polls >= 2 {
-                        tracing::error!(open = row.open_positions, "a leg vanished (liquidation?); closing the rest");
-                        self.notify(format!("⚠️ <b>a leg vanished</b> (liquidation?) — open positions {}, closing the rest", row.open_positions));
+                        tracing::error!(open, "a leg vanished (liquidation?); closing the rest");
+                        self.notify_critical(format!("⚠️ <b>a leg vanished</b> (liquidation?) — open positions {open}, closing the rest"));
                         break;
                     }
                 }
@@ -742,53 +950,86 @@ impl Engine {
             let pp = Params::path(&self.state_path);
             if let Some(mut p) = Params::load(&pp) {
                 p.liquidate = false;
-                p.paused = true;
+                if !p.paused { p.pause("liquidated"); }
                 let _ = p.save(&pp);
             }
-            self.notify("🛑 <b>liquidated</b>: pair closed by request, farm paused".to_string());
+            self.notify_critical("🛑 <b>liquidated</b>: pair closed by request, farm paused".to_string());
         }
         Ok(())
     }
 
-    /// One Close intent for all ids; confirm they are gone, resubmit with a fresh nonce if not.
+    /// One Close intent for all ids; confirm they are gone. The relayer answers `noOpenPositions` both
+    /// when the legs are really gone (liquidated / an earlier close landed) and while it already holds
+    /// a pending close for them, so that refusal means "check the account and wait", never "retry".
     async fn close_ids(&mut self, ids: Vec<U256>) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
+        let t_all = Instant::now();
+        let mut pending_noted = false;
         for attempt in 1..=3 {
+            if self.open_count().await == Some(0) {
+                tracing::info!(?ids, "nothing left to close");
+                return Ok(());
+            }
             let msg = Close { user: self.user, positionIds: ids.clone(), nonce: self.st.take_nonce(), deadline: sign::deadline() };
             self.st.save(&self.state_path)?;
-            if let Err(e) = self.submit(&msg).await {
-                tracing::error!(attempt, error = %e, "close refused");
-                continue;
-            }
+            let wait = match self.submit(&msg).await {
+                Ok(_) => CLOSE_TIMEOUT,
+                Err(e) if e.to_string().contains("noOpenPositions") => {
+                    tracing::warn!(attempt, "relayer says noOpenPositions; our close is queued or the legs are gone — waiting");
+                    CLOSE_PENDING_MAX
+                }
+                Err(e) => {
+                    tracing::error!(attempt, error = %e, "close refused");
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
+            };
             if self.args.dry_run {
                 return Ok(());
             }
             let t0 = Instant::now();
-            while t0.elapsed() < CLOSE_TIMEOUT {
+            while t0.elapsed() < wait {
                 tokio::time::sleep(Duration::from_millis(800)).await;
-                let row = self.api.account_row(self.user).await?;
-                if row.open_positions == 0 {
-                    tracing::info!(?ids, ms = t0.elapsed().as_millis(), "pair closed");
+                if self.open_count().await == Some(0) {
+                    tracing::info!(?ids, ms = t_all.elapsed().as_millis(), "pair closed");
+                    self.st.worst_close_s = self.st.worst_close_s.max(t_all.elapsed().as_secs());
                     return Ok(());
+                }
+                if !pending_noted && t_all.elapsed() > Duration::from_secs(30) {
+                    pending_noted = true;
+                    self.notify(format!("⏳ <b>close pending at the relayer</b> for {}s — legs still open, watching", t_all.elapsed().as_secs()));
                 }
             }
             tracing::warn!(attempt, "close not confirmed; resubmitting");
         }
-        Err(anyhow!("could not confirm close of {ids:?}"))
+        if self.open_count().await == Some(0) {
+            return Ok(());
+        }
+        Err(anyhow!("could not confirm close of {ids:?} after {}s", t_all.elapsed().as_secs()))
+    }
+
+    /// Open-position count from the indexer, None if unreachable.
+    async fn open_count(&self) -> Option<u32> {
+        self.api.account_row(self.user).await.ok().map(|r| r.open_positions)
     }
 
     async fn reconcile(&mut self, pair: &Pair, mid_close: f64, mv: f64) -> Result<()> {
         let want: Vec<String> = pair.ids.iter().map(|i| i.to_string()).collect();
         let mut trades = Vec::new();
-        for _ in 0..15 {
-            trades = self.api.account_trades(self.user).await?;
+        for _ in 0..60 {
+            trades = self.api.account_trades(self.user).await.unwrap_or_default();
             trades.retain(|t| want.contains(&t.position_id));
             if trades.len() == pair.ids.len() {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let partial = trades.len() < pair.ids.len();
+        if partial {
+            tracing::warn!(have = trades.len(), want = pair.ids.len(), "trades not indexed yet; ledger row marked partial");
+            self.st.partial_cycles.push(self.st.cycles_done + 1);
         }
         let pnl: i128 = trades.iter().filter_map(|t| t.adjusted_pnl_raw.parse::<i128>().ok()).sum();
         let minted: u128 = trades.iter().filter_map(|t| t.paper_minted_raw.parse::<u128>().ok()).sum();
@@ -800,6 +1041,7 @@ impl Engine {
             "move": mv, "elapsed_s": pair.opened_at.elapsed().as_secs(),
             "pnl_usd": pnl as f64 / E18, "fees_usd": fees as f64 / E18, "paper_minted": minted as f64 / E18,
             "kinds": trades.iter().map(|t| t.kind.clone()).collect::<Vec<_>>(),
+            "partial": partial,
         });
         tracing::info!(%row, "cycle done");
         ledger_append(&self.ledger_path, &row).context("ledger")?;
@@ -814,15 +1056,63 @@ impl Engine {
             let eff = if cost > 0.0 { minted as f64 / E18 / cost } else { 0.0 };
             let theo = if rate > 0.0 { 0.98 * rate / (1.0 - keep_frac(mv.max(1e-6), pair.coin.pos_mult)) } else { 0.0 };
             let liq = trades.iter().any(|t| t.kind == "Liquidated");
-            self.notify(format!(
-                "✅ <b>Cycle {} · {} · {:.3}% in {}</b>{}\n<code>result       </code>{} → <b>{} PAPER</b> ({:.0}/$ · model {:.0}/$)\n<code>all-time     </code>{} PAPER for {} → {:.0}/$\n<code>rate         </code>{:.2}/$",
+            let card = crate::card::Card {
+                kicker: format!("UwU bot · cycle {}{}", self.st.cycles_done + 1, if liq { " · LIQUIDATED" } else { "" }),
+                hero: fpaper(minted as f64 / E18), hero_unit: "PAPER".into(),
+                sub: format!("for {} → {eff:.0} PAPER/$ (model {theo:.0}/$)", fmoney(cost)),
+                chips: vec![
+                    ("market".into(), format!("{} {}×", pair.coin.name, pair.leverage)),
+                    ("move".into(), format!("{:.2}% in {}", mv * 100.0, fdur(pair.opened_at.elapsed().as_secs()))),
+                    ("margin".into(), fmoney(pair.margin_raw as f64 / E18 * 2.0)),
+                    ("rate".into(), format!("{rate:.1}/$")),
+                ],
+                footer: format!("all-time {} PAPER · {} → {:.0}/$", fpaper(tot_paper), fmoney(tot_spent), if tot_spent > 0.0 { tot_paper / tot_spent } else { 0.0 }),
+                progress: Some(if theo > 0.0 { eff / theo } else { 0.0 }),
+                accent: if liq { crate::card::RED } else { crate::card::MINT },
+            };
+            let text = format!(
+                "✅ <b>Cycle {} · {} · {:.3}% in {}</b>{}{}\n<code>result       </code>{} → <b>{} PAPER</b> ({:.0}/$ · model {:.0}/$)\n<code>all-time     </code>{} PAPER for {} → {:.0}/$\n<code>rate         </code>{:.2}/$",
                 self.st.cycles_done + 1, pair.coin.name, mv * 100.0, fdur(pair.opened_at.elapsed().as_secs()),
-                if liq { " ⚠️ liquidation" } else { "" },
+                if liq { " ⚠️ liquidation" } else { "" }, if partial { " (partial: trades not indexed yet, backfilled later)" } else { "" },
                 fmoney(pnl as f64 / E18), fpaper(minted as f64 / E18), eff, theo,
                 fpaper(tot_paper), fmoney(tot_spent), if tot_spent > 0.0 { tot_paper / tot_spent } else { 0.0 }, rate
-            ));
+            );
+            match self.notifier.as_ref() {
+                Some(n) => n.send_card(card, text),
+                None => tracing::info!("{text}"),
+            }
         }
         Ok(())
+    }
+
+    /// Fill in ledger rows whose trades the indexer had not served at close time.
+    async fn backfill(&mut self) {
+        if self.st.partial_cycles.is_empty() { return; }
+        let Ok(trades) = self.api.account_trades(self.user).await else { return };
+        let mut rows = ledger_rows(&self.ledger_path);
+        let mut done = Vec::new();
+        for &cycle in &self.st.partial_cycles {
+            let Some(row) = rows.iter_mut().find(|r| r["cycle"].as_u64() == Some(cycle)) else { done.push(cycle); continue };
+            let ids: Vec<String> = row["ids"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            let mine: Vec<_> = trades.iter().filter(|t| ids.contains(&t.position_id)).collect();
+            if mine.len() < ids.len() { continue; }
+            let pnl: i128 = mine.iter().filter_map(|t| t.adjusted_pnl_raw.parse::<i128>().ok()).sum();
+            let minted: u128 = mine.iter().filter_map(|t| t.paper_minted_raw.parse::<u128>().ok()).sum();
+            let fees: u128 = mine.iter().filter_map(|t| t.user_paid_fee_raw.parse::<u128>().ok()).sum();
+            row["pnl_usd"] = json!(pnl as f64 / E18);
+            row["paper_minted"] = json!(minted as f64 / E18);
+            row["fees_usd"] = json!(fees as f64 / E18);
+            row["kinds"] = json!(mine.iter().map(|t| t.kind.clone()).collect::<Vec<_>>());
+            row["partial"] = json!(false);
+            tracing::info!(cycle, "ledger row backfilled");
+            self.notify(format!("🧾 cycle {cycle} backfilled: {} → {} PAPER", fmoney(pnl as f64 / E18), fpaper(minted as f64 / E18)));
+            done.push(cycle);
+        }
+        if done.is_empty() { return; }
+        if ledger_rewrite(&self.ledger_path, &rows).is_ok() {
+            self.st.partial_cycles.retain(|c| !done.contains(c));
+            let _ = self.st.save(&self.state_path);
+        }
     }
 
     fn clear_in_flight(&mut self) -> Result<()> {
@@ -834,7 +1124,7 @@ impl Engine {
     pub async fn close_all(&mut self) -> Result<()> {
         // the pair we opened is in state.json; only fall back to a log scan when nothing is recorded
         let mut ids: Vec<U256> = self.st.in_flight.as_ref().map(|f| f.position_ids.clone()).unwrap_or_default();
-        let open_count = self.api.account_row(self.user).await.map(|a| a.open_positions).unwrap_or(0);
+        let open_count = self.api.account_row(self.user).await?.open_positions;
         if ids.is_empty() && open_count > 0 {
             let latest = self.chain.block_number().await?;
             let from = latest.saturating_sub(3000);
@@ -847,12 +1137,47 @@ impl Engine {
                 .collect();
         }
         if open_count == 0 {
+            // the record stays: the engine reconciles it itself (recover → "already closed")
             tracing::info!("close-all: nothing open");
-            return self.clear_in_flight();
+            return Ok(());
         }
         tracing::info!(?ids, "close-all");
         self.notify(format!("🛑 <b>close-all</b>: {} position(s)", ids.len()));
         self.close_ids(ids).await?;
         self.clear_in_flight()
     }
+}
+
+/// Close everything from outside the engine (responder watchdog, /liquidate): one Close intent,
+/// nothing written to state.json — the engine owns that file and reconciles on its own. Returns the
+/// ids it asked to close.
+pub async fn close_detached(api: &Api, chain: &Chain, st: &State) -> Result<Vec<U256>> {
+    let user = st.user.context("no session registered")?;
+    let signer = PrivateKeySigner::from_str(st.session_key.as_deref().context("no session key")?)?;
+    let domain = sign::exchange_domain(crate::CHAIN_ID, Address::from_str(crate::EXCHANGE)?);
+    let open = api.account_row(user).await?.open_positions;
+    if open == 0 {
+        tracing::info!("close-detached: nothing open");
+        return Ok(vec![]);
+    }
+    let mut ids: Vec<U256> = st.in_flight.as_ref().map(|f| f.position_ids.clone()).unwrap_or_default();
+    if ids.is_empty() {
+        let latest = chain.block_number().await?;
+        let from = latest.saturating_sub(3000);
+        let opened = chain.opened(user, from, latest).await?;
+        let closed = chain.closed(user, from, latest).await?;
+        ids = opened.iter().filter(|o| !closed.iter().any(|c| c.position_id == o.position_id)).map(|o| o.position_id).collect();
+    }
+    if ids.is_empty() {
+        bail!("{open} position(s) open but none found in the record or the last 3000 blocks");
+    }
+    // a fresh random nonce: this process never touches the engine's counter
+    let msg = Close { user, positionIds: ids.clone(), nonce: sign::seed_nonce(), deadline: sign::deadline() };
+    let signed = sign::sign(&signer, &domain, &msg)?;
+    match api.post_intent(signed.action, &signed.body).await {
+        Ok(_) => tracing::info!(?ids, "close-detached accepted"),
+        Err(e) if e.to_string().contains("noOpenPositions") => tracing::info!(?ids, "close-detached: a close is already queued or the legs are gone"),
+        Err(e) => return Err(e),
+    }
+    Ok(ids)
 }

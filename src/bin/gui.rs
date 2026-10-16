@@ -141,7 +141,7 @@ enum Message {
     FeedReady(Feed),
     Protocol(Result<Summary, String>),
     Account(Result<AccountRow, String>),
-    Balances(Result<(f64, f64), String>),
+    Balances(Result<(f64, f64, f64), String>),
     MasterKey(String),
     ToggleRegister,
     Register,
@@ -177,6 +177,7 @@ struct App {
     account: Option<AccountRow>,
     evm_usdc: Option<f64>,
     core_usdc: Option<f64>,
+    staked: Option<f64>,
     mids: VecDeque<(f64, f64)>,
     chart_coin: &'static str,
     started: Instant,
@@ -219,6 +220,7 @@ impl App {
             account: None,
             evm_usdc: None,
             core_usdc: None,
+            staked: None,
             mids: VecDeque::with_capacity(400),
             chart_coin: "BTC",
             started: Instant::now(),
@@ -293,6 +295,7 @@ impl App {
         let a = self.run_args()?;
         let mut p = Engine::params_from_args(&a);
         p.paused = self.live_params.as_ref().map(|l| l.paused).unwrap_or(false);
+        p.min_balance_usd = self.live_params.as_ref().map(|l| l.min_balance_usd).unwrap_or(0.0);
         p.validate()?;
         Ok(p)
     }
@@ -316,7 +319,7 @@ impl App {
                 Err(e) => self.err = Some(e),
             },
             Message::Account(r) => if let Ok(a) = r { self.account = Some(a) },
-            Message::Balances(r) => if let Ok((e, c)) = r { self.evm_usdc = Some(e); self.core_usdc = Some(c); },
+            Message::Balances(r) => if let Ok((e, c, s)) = r { self.evm_usdc = Some(e); self.core_usdc = Some(c); self.staked = Some(s); },
             Message::MasterKey(s) => self.master_key = s,
             Message::ToggleRegister => { self.show_register = !self.show_register; self.register_note = None; }
             Message::Register => {
@@ -427,7 +430,8 @@ impl App {
                             async move {
                                 let spot = api.hypercore_spot_usdc(u).await.map_err(|e| e.to_string())?;
                                 let (perp, _) = api.hypercore_perp_usdc(u).await.unwrap_or((0.0, 0.0));
-                                Ok((spot, perp))
+                                let staked = api.staked_paper(u).await.unwrap_or(0.0);
+                                Ok((spot, perp, staked))
                             },
                             Message::Balances,
                         ));
@@ -508,7 +512,8 @@ impl App {
             kv("margin in use", format!("${in_use:.2}"), if in_use > 0.0 { PINK } else { FG2 }),
             kv("open positions", self.account.as_ref().map(|a| a.open_positions.to_string()).unwrap_or("…".into()),
                match self.account.as_ref().map(|a| a.open_positions) { Some(2) => MINT, Some(1) => RED, _ => FG2 }),
-            kv("PAPER held", self.account.as_ref().map(|a| fmt_n(a.paper_raw as f64 / E18)).unwrap_or("…".into()), PINK),
+            kv("PAPER minted", self.account.as_ref().map(|a| fmt_n(a.paper_raw as f64 / E18)).unwrap_or("…".into()), PINK),
+            kv("PAPER staked", self.staked.map(fmt_n).unwrap_or("…".into()), PINK),
             session_line,
         ]
         .spacing(4);

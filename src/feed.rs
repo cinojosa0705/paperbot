@@ -73,7 +73,7 @@ impl Feed {
                     Err(e) => tracing::warn!(error = %e, "feed disconnected; reconnecting in {backoff}s"),
                 }
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
-                backoff = (backoff * 2).min(30);
+                backoff = (backoff * 2).min(3); // a price blackout under a 159× pair is the one thing we cannot afford
             }
         });
         feed

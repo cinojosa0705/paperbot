@@ -15,7 +15,7 @@ impl Notifier {
         let token = std::env::var("PAPERBOT_TG_TOKEN").ok().filter(|s| !s.trim().is_empty())?;
         let chat = std::env::var("PAPERBOT_TG_CHAT").ok().filter(|s| !s.trim().is_empty())?;
         Some(Self {
-            http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(8)).build().ok()?,
+            http: reqwest::Client::builder().http1_only().local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).connect_timeout(std::time::Duration::from_secs(5)).timeout(std::time::Duration::from_secs(8)).build().ok()?,
             token: token.trim().to_string(),
             chat: chat.trim().to_string(),
         })
@@ -25,7 +25,20 @@ impl Notifier {
         Self::from_env().is_some()
     }
 
+    /// Three quick attempts: the operator's laptop is on a lossy hotspot and ~1 request in 10 hangs.
     pub async fn send_now(&self, text: &str) -> Result<()> {
+        let mut last = None;
+        for delay in [0u64, 2, 5] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            match self.send_once(text).await {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap())
+    }
+
+    async fn send_once(&self, text: &str) -> Result<()> {
         let r = self
             .http
             .post(format!("https://api.telegram.org/bot{}/sendMessage", self.token))
@@ -58,6 +71,61 @@ impl Notifier {
             .json(&json!({ "callback_query_id": id, "text": text })).send().await;
     }
 
+    /// sendPhoto with an HTML caption (≤1024 chars; longer captions are sent as a second message).
+    pub async fn send_photo(&self, png: Vec<u8>, caption: &str) -> Result<()> {
+        let (cap, rest) = if caption.chars().count() <= 1024 { (caption.to_string(), None) } else {
+            let head: String = caption.lines().next().unwrap_or("").to_string();
+            (head, Some(caption.to_string()))
+        };
+        let mut last = None;
+        for delay in [0u64, 2, 5] {
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            let form = reqwest::multipart::Form::new()
+                .text("chat_id", self.chat.clone())
+                .text("parse_mode", "HTML")
+                .text("caption", cap.clone())
+                .part("photo", reqwest::multipart::Part::bytes(png.clone()).file_name("uwu.png").mime_str("image/png")?);
+            match self.http.post(format!("https://api.telegram.org/bot{}/sendPhoto", self.token)).multipart(form).send().await {
+                Ok(r) if r.status().is_success() => {
+                    if let Some(t) = rest { self.send_now(&t).await?; }
+                    return Ok(());
+                }
+                Ok(r) => last = Some(anyhow::anyhow!("telegram {}: {}", r.status(), r.text().await.unwrap_or_default())),
+                Err(e) => last = Some(e.into()),
+            }
+        }
+        Err(last.unwrap())
+    }
+
+    /// Render a card and send it with the text as caption; falls back to the text alone.
+    /// Never blocks the caller.
+    pub fn send_card(&self, card: crate::card::Card, text: String) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let png = tokio::task::spawn_blocking(move || crate::card::render(&card)).await.map_err(|e| anyhow::anyhow!(e)).and_then(|r| r);
+            let ok = match png {
+                Ok(png) => me.send_photo(png, &text).await.map_err(|e| tracing::warn!(error = %e, "card send failed; sending text")).is_ok(),
+                Err(e) => { tracing::warn!(error = %e, "card render failed; sending text"); false }
+            };
+            if !ok { if let Err(e) = me.send_now(&text).await { tracing::warn!(error = %e, "telegram send failed"); } }
+        });
+    }
+
+    /// For alerts that must land: retried over ~2 minutes, never blocks the caller.
+    pub fn send_critical(&self, text: String) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            for delay in [0u64, 10, 30, 60, 60] {
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                match me.send_now(&text).await {
+                    Ok(()) => return,
+                    Err(e) => tracing::warn!(error = %e, "critical telegram send failed; retrying"),
+                }
+            }
+            tracing::error!("critical telegram alert dropped after retries: {text}");
+        });
+    }
+
     /// Never blocks the caller; failures are logged, not raised.
     pub fn send(&self, text: String) {
         let me = self.clone();
@@ -69,15 +137,27 @@ impl Notifier {
     }
 }
 
+/// Anyone says uwu, the bot says it back. `<kaomoji> ~ UwU ~ <kaomoji>`, two random ones.
+pub fn uwu() -> String {
+    const K: &[&str] = &[
+        "(｡♥‿♥｡)", "(◕‿◕✿)", "(ᵕ꒳ᵕ)", "(´｡• ᵕ •｡`)", "(✿◠‿◠)", "ʕ•ᴥ•ʔ", "(=^･ω･^=)", "(≧◡≦)", "(⁄ ⁄•⁄ω⁄•⁄ ⁄)",
+        "(つ✧ω✧)つ", "(*≧ω≦*)", "(๑˃ᴗ˂)ﻭ", "(｡•̀ᴗ-)✧", "ヽ(>∀<☆)ノ", "(´ ω `♡)", "(灬º‿º灬)♡", "₍ᐢ•ᴗ•ᐢ₎", "(◍•ᴗ•◍)❤",
+        "٩(◕‿◕｡)۶", "(✧ω✧)", "(⌒‿⌒)", "(｡•́‿•̀｡)", "(ﾉ◕ヮ◕)ﾉ*:･ﾟ✧", "ʕ ᵔᴥᵔ ʔ", "(＾▽＾)", "(´♡‿♡`)", "( ˘ ³˘)♥", "(≧▽≦)",
+    ];
+    use rand::seq::SliceRandom;
+    let mut r = rand::thread_rng();
+    let a = K.choose(&mut r).unwrap_or(&"(◕‿◕)");
+    let b = K.choose(&mut r).unwrap_or(&"(◕‿◕)");
+    format!("{a} ~ UwU ~ {b}")
+}
+
 // ---------- command bot ----------
 
 use crate::api::Api;
-use crate::engine::{keep_frac, Engine};
+use crate::engine::{close_detached, keep_frac};
 use crate::feed::Feed;
 use crate::positions::Chain;
 use crate::state::{heartbeat_age, ledger_rows, Params, State};
-use crate::RunArgs;
-use clap::Parser;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -98,16 +178,18 @@ pub struct Commander {
 
 const COMMANDS: &[(&str, &str)] = &[
     ("status", "overview: farm · pair · account · 24h · protocol"),
+    ("portfolio", "everything you hold: HyperCore USDC, papertrade equity, PAPER wallet/staked, lifetime pnl, rank"),
     ("pair", "the open pair live: pnl, net if closed, progress, ETA"),
     ("positions", "every open position, flags untracked ones"),
     ("strategy", "BTC vs ETH: keep, cost, PAPER per $, vol, cycle time"),
     ("calculate", "optimal move per market from live stats, with apply buttons (also posted hourly)"),
     ("stats", "performance: all-time, 24h, per market, pace, supply share"),
+    ("flex", "brag card: total PAPER, cycles, volume, how far above the protocol rate"),
     ("rate", "mint curve, measured decay, half-life"),
     ("cycles", "last cycles table (/cycles 10)"),
     ("health", "engine heartbeat, feed, exchange gates, session key"),
     ("params", "live parameters"),
-    ("set", "/set move 0.4 · buffer 40 · market eth · capital 0.5 · ddstop 50 · ratefloor 8 · maxcycles 20|off"),
+    ("set", "/set move 0.4 · buffer 40 · market eth · capital 0.5 · ddstop 50 · minbalance 500|off · ratefloor 8 · maxcycles 20|off"),
     ("pause", "no new pairs; the open pair finishes"),
     ("resume", "continue opening pairs"),
     ("liquidate", "close everything and pause (asks for a code)"),
@@ -122,6 +204,10 @@ pub fn money(v: f64) -> String {
     let cents = ((a - a.trunc()) * 100.0).round() as u64;
     let (whole, cents) = if cents == 100 { (whole + 1, 0) } else { (whole, cents) };
     format!("{}${}.{:02}", if neg { "−" } else { "" }, thousands(whole), cents)
+}
+/// "$2.77M" / "$41.2k" for chips.
+fn compact_money(v: f64) -> String {
+    if v >= 1e6 { format!("${:.2}M", v / 1e6) } else if v >= 1e3 { format!("${:.1}k", v / 1e3) } else { money(v) }
 }
 pub fn paper(v: f64) -> String {
     thousands(v.max(0.0).round() as u64)
@@ -164,7 +250,7 @@ impl Commander {
         }
         Some(Self {
             n: Notifier::from_env()?,
-            long: reqwest::Client::builder().timeout(std::time::Duration::from_secs(40)).build().ok()?,
+            long: reqwest::Client::builder().http1_only().local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).connect_timeout(std::time::Duration::from_secs(5)).timeout(std::time::Duration::from_secs(30)).build().ok()?,
             api,
             feed,
             state_path,
@@ -187,36 +273,44 @@ impl Commander {
         });
     }
 
-    /// If a pair is in flight and the engine's heartbeat goes quiet, alert at 45s and close at 120s.
+    /// If a pair is in flight and the engine's heartbeat goes quiet, alert at 2 minutes and close at
+    /// 10. The heartbeat is a background task in the engine process, so silence means the process is
+    /// gone (launchd brings it back in ~10 s and it re-adopts the pair) or hung — only the hang needs
+    /// us. Silence must be seen on consecutive ticks; the close never touches state.json.
     async fn watchdog(&self) {
         let mut alerted = false;
+        let mut silent_ticks = 0u32;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
             let st = self.state();
-            let Some(f) = st.in_flight.clone() else { alerted = false; continue };
-            let age = heartbeat_age(&self.state_path).unwrap_or(u64::MAX);
-            if age <= 45 {
+            let Some(f) = st.in_flight.clone() else { alerted = false; silent_ticks = 0; continue };
+            let Some(age) = heartbeat_age(&self.state_path) else { continue };
+            if age <= 120 {
+                if alerted { self.n.send_critical("🟢 engine heartbeat back".to_string()); }
                 alerted = false;
+                silent_ticks = 0;
                 continue;
             }
+            silent_ticks += 1;
             if !alerted {
                 alerted = true;
-                let _ = self.n.send_now(&format!("🚨 <b>Engine not responding</b> for {} with a pair open ({} {}×, ids {}) — closing it myself at 2 minutes",
-                    dur(age.min(99_999)), f.coin, f.leverage, f.position_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", "))).await;
+                self.n.send_critical(format!("🚨 <b>Engine not responding</b> for {} with a pair open ({} {}×, ids {}) — launchd should restart it; I close the pair myself at 10 minutes",
+                    dur(age.min(99_999)), f.coin, f.leverage, f.position_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")));
             }
-            if age > 120 {
-                let (_tx, rx) = tokio::sync::watch::channel(false);
-                let note = match (Chain::new(&crate::positions::rpc_url()), self.feed.clone()) {
-                    (Ok(chain), Some(feed)) => match Engine::new(self.api.clone(), chain, feed, self.state(), RunArgs::parse_from(["run"]), self.state_path.clone(), self.ledger_path.clone(), rx) {
-                        Ok(mut eng) => match eng.close_all().await { Ok(()) => "closed".to_string(), Err(e) => format!("close failed: {e}") },
-                        Err(e) => format!("engine: {e}"),
+            if age > 600 && silent_ticks >= 30 {
+                let note = match Chain::new(&crate::positions::rpc_url()) {
+                    Ok(chain) => match close_detached(&self.api, &chain, &st).await {
+                        Ok(ids) if ids.is_empty() => "nothing open".to_string(),
+                        Ok(ids) => format!("close posted for {}", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")),
+                        Err(e) => format!("close failed: {e}"),
                     },
-                    _ => "no feed/rpc".into(),
+                    Err(e) => format!("no rpc: {e}"),
                 };
                 let pp = Params::path(&self.state_path);
-                if let Some(mut p) = Params::load(&pp) { p.paused = true; let _ = p.save(&pp); }
-                let _ = self.n.send_now(&format!("🛑 <b>Watchdog</b>: engine silent {} — pair {} · farm paused. Restart the engine and /resume.", dur(age.min(99_999)), note)).await;
+                if let Some(mut p) = Params::load(&pp) { p.pause("watchdog: engine silent"); let _ = p.save(&pp); }
+                self.n.send_critical(format!("🛑 <b>Watchdog</b>: engine silent {} — {note} · farm paused. Check the engine (scripts/doctor.sh) and /resume.", dur(age.min(99_999))));
                 alerted = false;
+                silent_ticks = 0;
             }
         }
     }
@@ -227,10 +321,22 @@ impl Commander {
             let mut conflicts = 0u32;
             let mut last_expiry_warning = 0u64;
             let mut last_calc = 0u64;
+            let digest_hour: u64 = std::env::var("PAPERBOT_DIGEST_UTC_HOUR").ok().and_then(|s| s.parse().ok()).unwrap_or(13);
+            let mut last_digest_day = crate::sign::now_secs() / 86_400;
             loop {
-                // every hour: recompute the optimum and post it
                 let now = crate::sign::now_secs();
-                if now.saturating_sub(last_calc) >= 3600 {
+                // once a day at PAPERBOT_DIGEST_UTC_HOUR: the numbers that matter
+                if now / 86_400 != last_digest_day && (now % 86_400) / 3600 >= digest_hour {
+                    last_digest_day = now / 86_400;
+                    let text = format!("☀️ <b>Daily digest</b>\n{}\n{}", self.stats().await, self.farm_line(&self.state(), &self.params()));
+                    match self.stats_card().await {
+                        Some(card) => self.n.send_card(card, text),
+                        None => self.n.send_critical(text),
+                    }
+                }
+                // every hour: recompute the optimum and post it
+                // skipped while the farm is paused; /calculate still works on demand
+                if now.saturating_sub(last_calc) >= 3600 && !self.params().paused {
                     last_calc = now;
                     if let Some((text, buttons, sig)) = self.calculate(true).await {
                         let changed = self.last_rec.lock().unwrap().as_deref() != Some(sig.as_str());
@@ -271,7 +377,9 @@ impl Commander {
                             let m = &u["message"];
                             let chat = m["chat"]["id"].as_i64().map(|i| i.to_string()).unwrap_or_default();
                             let Some(text) = m["text"].as_str() else { continue };
-                            if chat != self.n.chat || !text.starts_with('/') {
+                            if chat != self.n.chat { continue; }
+                            if !text.starts_with('/') {
+                                if text.to_lowercase().contains("uwu") { self.n.send(uwu()); }
                                 continue;
                             }
                             let from = m["from"]["id"].as_i64().map(|i| i.to_string()).unwrap_or_default();
@@ -282,6 +390,10 @@ impl Commander {
                             let name = m["from"]["first_name"].as_str().unwrap_or("someone").to_string();
                             let reply = self.handle(text, &from, &name).await;
                             if reply.is_empty() { continue; }
+                            if let Some(card) = self.card_for(text).await {
+                                self.n.send_card(card, reply);
+                                continue;
+                            }
                             if let Err(e) = self.n.send_now(&reply).await {
                                 tracing::warn!(error = %e, "telegram reply failed");
                             }
@@ -297,7 +409,7 @@ impl Commander {
                             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
                         } else {
                             tracing::warn!(error = %s, "telegram poll failed");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         }
                     }
                 }
@@ -336,6 +448,7 @@ impl Commander {
         let arg2 = it.next();
         match cmd.as_str() {
             "status" => self.status().await,
+            "portfolio" | "wallet" => self.portfolio().await,
             "pair" => self.pair().await,
             "positions" | "position" => self.positions().await,
             "strategy" => self.strategy().await,
@@ -350,17 +463,18 @@ impl Commander {
                 None => "not enough data yet (feed warming up or no account)".into(),
             },
             "stats" => self.stats().await,
+            "flex" => self.flex().await,
             "rate" => self.rate().await,
             "cycles" => self.cycles(arg.and_then(|a| a.parse().ok()).unwrap_or(6)),
             "health" => self.health().await,
             "params" => format!("{}{}\n<i>changes apply from the next pair</i>", h("🔧 Parameters"), self.params_block(&self.params())),
             "set" => match (arg, arg2) {
                 (Some(k), Some(v)) => self.set(k, v, name).await,
-                _ => format!("{}<code>/set key value</code>\nkeys: move · buffer · market · capital · ddstop · ratefloor · maxcycles", h("🔧 Usage")),
+                _ => format!("{}<code>/set key value</code>\nkeys: move · buffer · market · capital · ddstop · minbalance ($) · ratefloor · maxcycles", h("🔧 Usage")),
             },
             "pause" | "resume" => {
                 let mut p = self.params();
-                p.paused = cmd == "pause";
+                if cmd == "pause" { p.pause(&format!("by {name}")) } else { p.resume() }
                 match p.save(&Params::path(&self.state_path)) {
                     Ok(()) => if p.paused { format!("⏸ <b>Paused</b> by {name}\nThe open pair (if any) finishes; no new pairs until /resume.") } else { format!("▶️ <b>Resumed</b> by {name}") },
                     Err(e) => format!("could not save params: {e}"),
@@ -369,6 +483,81 @@ impl Commander {
             "liquidate" => self.liquidate(arg, from, name).await,
             _ => self.help(),
         }
+    }
+
+    /// The commands that come with a picture.
+    pub async fn card_for(&self, text: &str) -> Option<crate::card::Card> {
+        match text.trim_start_matches('/').split_whitespace().next().unwrap_or("").split('@').next().unwrap_or("") {
+            "status" => self.status_card().await,
+            "stats" => self.stats_card().await,
+            "flex" => self.flex_card().await,
+            _ => None,
+        }
+    }
+
+    async fn status_card(&self) -> Option<crate::card::Card> {
+        use crate::card::{Card, MINT, PINK, RED};
+        let (st, p) = (self.state(), self.params());
+        let rows = ledger_rows(&self.ledger_path);
+        let (an, ap, asp, _) = self.totals(&rows);
+        let rate = self.api.summary().await.map(|s| s.mint_rate()).ok();
+        let footer = format!("all-time {} cycles · {} PAPER · {} → {:.0}/${}", an, paper(ap), money(asp), if asp > 0.0 { ap / asp } else { 0.0 },
+            rate.map(|r| format!(" · rate {r:.1}/$")).unwrap_or_default());
+        let equity = match st.user { Some(u) => self.api.account_row(u).await.ok().map(|a| {
+            let in_use = if a.open_positions > 0 { st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0) } else { 0.0 };
+            a.balance_raw as f64 / 1e18 + in_use + a.queued_raw as f64 / 1e18 }), None => None };
+        let mut chips = vec![];
+        Some(match st.in_flight.as_ref() {
+            Some(f) => {
+                let target = if f.target_move > 0.0 { f.target_move } else { p.move_pct / 100.0 };
+                let age = dur(crate::sign::now_secs().saturating_sub(f.opened_at));
+                let (mv, net) = self.pair_value(f).map(|(_, _, _, net, _, mv)| (mv, net)).unwrap_or((0.0, 0.0));
+                chips.push(("pair".into(), format!("{} {}×", f.coin, f.leverage)));
+                chips.push(("margin".into(), money(f.margin_raw as f64 / 1e18 * 2.0)));
+                chips.push(("open for".into(), age));
+                chips.push(("net now".into(), signed(net)));
+                Card { kicker: format!("UwU bot · cycle {} in progress", st.cycles_done + 1), hero: format!("{:.3}%", mv * 100.0), hero_unit: format!("of {:.2}%", target * 100.0),
+                    sub: format!("{}{}", equity.map(|e| format!("equity {} · ", money(e))).unwrap_or_default(), self.farm_line(&st, &p).replace("<b>", "").replace("</b>", "")),
+                    chips, footer, progress: Some(mv / target), accent: if net < 0.0 { PINK } else { MINT } }
+            }
+            None => {
+                let paused = p.paused;
+                chips.push(("farm".into(), if paused { "paused".into() } else { "idle".into() }));
+                chips.push(("market".into(), p.market.to_uppercase()));
+                chips.push(("move".into(), format!("{:.2}%", p.move_pct)));
+                if let Some(e) = equity { chips.push(("equity".into(), money(e))); }
+                Card { kicker: "UwU bot · no pair open".into(), hero: paper(ap), hero_unit: "PAPER".into(),
+                    sub: if paused { format!("paused{}", p.pause_reason.as_ref().map(|r| format!(" · {r}")).unwrap_or_default()) } else { "between cycles".into() },
+                    chips, footer, progress: None, accent: if paused { RED } else { PINK } }
+            }
+        })
+    }
+
+    async fn stats_card(&self) -> Option<crate::card::Card> {
+        use crate::card::{Card, MINT};
+        let rows = ledger_rows(&self.ledger_path);
+        if rows.is_empty() { return None; }
+        let (n, pap, spent, secs) = self.totals(&rows);
+        let now = crate::sign::now_secs() as f64;
+        let day: Vec<_> = rows.iter().filter(|r| r["ts"].as_f64().unwrap_or(0.0) >= now - 86_400.0).cloned().collect();
+        let (dn, dp, ds, _) = self.totals(&day);
+        let first_open = rows.first().map(|r| r["ts"].as_f64().unwrap_or(now) - r["elapsed_s"].as_f64().unwrap_or(0.0)).unwrap_or(now);
+        let uptime = secs / (now - first_open).max(1.0) * 100.0;
+        let liqs = rows.iter().filter(|r| r["kinds"].as_array().map(|k| k.iter().any(|x| x == "Liquidated")).unwrap_or(false)).count();
+        let total = match self.state().user { Some(u) => self.api.account_row(u).await.ok().map(|a| a.paper_raw as f64 / 1e18), None => None };
+        Some(Card {
+            kicker: "UwU bot · all-time".into(), hero: paper(total.unwrap_or(pap).max(pap)), hero_unit: "PAPER".into(),
+            sub: format!("{} spent → {:.0} PAPER per $", money(spent), if spent > 0.0 { pap / spent } else { 0.0 }),
+            chips: vec![
+                ("cycles".into(), format!("{n} · {liqs} liq")),
+                ("24h PAPER".into(), paper(dp)),
+                (format!("24h · {dn} cyc"), format!("{:.0}/$", if ds > 0.0 { dp / ds } else { 0.0 })),
+                ("in a pair".into(), format!("{uptime:.0}%")),
+            ],
+            footer: format!("{} PAPER/h · avg cycle {}{}", paper(pap / ((now - first_open) / 3600.0).max(0.02)), dur((secs / n.max(1) as f64) as u64),
+                total.filter(|t| *t > pap).map(|_| format!(" · {} by the bot", paper(pap))).unwrap_or_default()),
+            progress: None, accent: MINT,
+        })
     }
 
     fn help(&self) -> String {
@@ -395,6 +584,7 @@ impl Commander {
         s.push_str(&row("buffer", format!("{:.0}%", p.buffer_pct)));
         s.push_str(&row("capital", format!("×{:.2} of balance", p.capital_fraction)));
         s.push_str(&row("dd stop", format!("−{:.0}% from peak", p.drawdown_stop_pct)));
+        s.push_str(&row("min balance", if p.min_balance_usd > 0.0 { money(p.min_balance_usd) } else { "off".into() }));
         s.push_str(&row("rate floor", format!("{:.1} PAPER/$", p.rate_floor)));
         s.push_str(&row("max cycles", p.max_cycles.map(|m| m.to_string()).unwrap_or("off".into())));
         s
@@ -449,11 +639,14 @@ impl Commander {
 
     fn farm_line(&self, st: &State, p: &Params) -> String {
         let engine = match heartbeat_age(&self.state_path) {
-            Some(a) if a <= 5 => "engine alive".to_string(),
+            Some(a) if a <= 15 => "engine alive".to_string(),
             Some(a) => format!("engine silent for {}", dur(a)),
             None => "no engine running".to_string(),
         };
-        let mode = if p.liquidate { "🛑 liquidating" } else if p.paused { "⏸ paused" } else if st.in_flight.is_some() { "▶️ in a cycle" } else { "▶️ running" };
+        let mode = if p.liquidate { "🛑 liquidating".to_string() } else if p.paused {
+            format!("⏸ paused{}{}", p.pause_reason.as_deref().map(|r| format!(" · {r}")).unwrap_or_default(),
+                p.paused_at.map(|t| format!(" · {} ago", dur(crate::sign::now_secs().saturating_sub(t)))).unwrap_or_default())
+        } else if st.in_flight.is_some() { "▶️ in a cycle".to_string() } else { "▶️ running".to_string() };
         format!("{mode} · {engine}")
     }
 
@@ -491,7 +684,8 @@ impl Commander {
                     let in_use = if a.open_positions > 0 { st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0) } else { 0.0 };
                     s.push_str(&row("equity", format!("{} (free {} · margin {})", money(avail + in_use + a.queued_raw as f64 / 1e18), money(avail), money(in_use))));
                     if a.queued_raw > 0 { s.push_str(&row("queued", money(a.queued_raw as f64 / 1e18))); }
-                    s.push_str(&row("PAPER held", paper(a.paper_raw as f64 / 1e18)));
+                    let staked = self.api.staked_paper(u).await.unwrap_or(0.0);
+                    s.push_str(&row("PAPER", format!("{} minted · {} staked", paper(a.paper_raw as f64 / 1e18), paper(staked))));
                 }
                 Err(e) => s.push_str(&row("account", format!("{e}"))),
             }
@@ -516,6 +710,50 @@ impl Commander {
         s
     }
 
+    async fn portfolio(&self) -> String {
+        let st = self.state();
+        let Some(u) = st.user else { return "no session registered".into() };
+        let mut s = h("💼 Portfolio");
+        let (spot, perp, acct, staked, sum) = tokio::join!(
+            self.api.hypercore_spot_usdc(u), self.api.hypercore_perp_usdc(u), self.api.account_row(u), self.api.staked_paper(u), self.api.summary()
+        );
+        let spot = spot.unwrap_or(0.0);
+        let perp = perp.map(|(v, _)| v).unwrap_or(0.0);
+        s.push_str(&row("HyperCore", format!("spot {} · perp {}", money(spot), money(perp))));
+        let mut equity = 0.0;
+        match acct {
+            Ok(a) => {
+                let free = a.balance_raw as f64 / 1e18;
+                let in_use = if a.open_positions > 0 { st.in_flight.as_ref().map(|f| 2.0 * f.margin_raw as f64 / 1e18).unwrap_or(0.0) } else { 0.0 };
+                let queued = a.queued_raw as f64 / 1e18;
+                equity = free + in_use + queued;
+                s.push_str(&row("papertrade", format!("<b>{}</b> (free {} · margin {} · queued {})", money(equity), money(free), money(in_use), money(queued))));
+                s.push_str(&row("USDC total", money(spot + perp + equity)));
+                let minted = a.paper_raw as f64 / 1e18;
+                let wallet = match crate::positions::Chain::new(&crate::positions::rpc_url()) {
+                    Ok(c) => c.erc20_balance(crate::PAPER, u).await.ok().map(|v| v as f64 / 1e18),
+                    Err(_) => None,
+                };
+                let staked = staked.unwrap_or(0.0);
+                s.push_str(&row("PAPER", format!("<b>{}</b> minted · wallet {} · staked {}", paper(minted), wallet.map(paper).unwrap_or("?".into()), paper(staked))));
+                if let Ok(sum) = &sum {
+                    if sum.supply > 0.0 {
+                        s.push_str(&row("share", format!("{:.4}% of supply · {:.4}% of staked", minted / sum.supply * 100.0, if sum.staked > 0.0 { staked / sum.staked * 100.0 } else { 0.0 })));
+                    }
+                }
+                s.push_str(&row("lifetime", format!("pnl {} · volume {} · rank {}", signed(a.realized_pnl_usd), money(a.volume_usd), a.rank.map(|r| format!("#{r}")).unwrap_or("—".into()))));
+            }
+            Err(e) => s.push_str(&row("papertrade", format!("{e}"))),
+        }
+        let rows = ledger_rows(&self.ledger_path);
+        let (n, p, spent, _) = self.totals(&rows);
+        s.push_str(&row("farm", format!("{n} cycles · {} spent → {} PAPER · <b>{:.0}/$</b>", money(spent), paper(p), if spent > 0.0 { p / spent } else { 0.0 })));
+        if equity > 0.0 && n > 0 {
+            s.push_str(&row("runway", format!("{} more at this pace", paper(equity * if spent > 0.0 { p / spent } else { 0.0 }))));
+        }
+        s
+    }
+
     async fn pair(&self) -> String {
         let st = self.state();
         let p = self.params();
@@ -524,7 +762,7 @@ impl Commander {
             return format!("{}{} {}× open, but no live feed in this process", h("🟢 Pair"), f.coin, f.leverage);
         };
         let d = if f.target_move > 0.0 { f.target_move } else { p.move_pct / 100.0 };
-        let bust_guard = d * (1.0 + p.buffer_pct / 100.0) - 0.0005;
+        let bust_guard = 1.0 / f.leverage as f64 - 0.0005;
         let rate = self.api.summary().await.map(|s| s.mint_rate()).unwrap_or(0.0);
         let n = f.margin_raw as f64 / 1e18 * f.leverage as f64;
         let elapsed = crate::sign::now_secs().saturating_sub(f.opened_at);
@@ -619,7 +857,7 @@ impl Commander {
         let vols: Vec<(&'static str, f64)> = [("BTC", 0.024), ("ETH", 0.031)].iter().map(|(c, fb)| (*c, feed.daily_vol(c).unwrap_or(*fb))).collect();
         let sampled = ["BTC", "ETH"].iter().all(|c| feed.daily_vol(c).is_some());
         let inp = Inputs {
-            equity_usd: equity, capital_fraction: p.capital_fraction, dd_stop: p.drawdown_stop_pct / 100.0,
+            equity_usd: equity, capital_fraction: p.capital_fraction, dd_stop: (p.drawdown_stop_pct / 100.0).min(if p.min_balance_usd > 0.0 && equity > 0.0 { (1.0 - p.min_balance_usd / equity).max(0.0) } else { 1.0 }),
             rate: sum.mint_rate(), decay_per_day: decay,
             min_notional: ts.min_open_notional_raw as f64 / 1e18,
             max_notional: ts.instruments.iter().map(|i| i.max_notional_raw as f64 / 1e18).fold(10e6, f64::min),
@@ -682,6 +920,9 @@ impl Commander {
         s.push_str(&row("efficiency", format!("<b>{eff:.0} PAPER/$</b> · {} per 1k PAPER", money(if pap > 0.0 { spent / pap * 1000.0 } else { 0.0 }))));
         s.push_str(&row("24h", format!("{dn} cycles · {} PAPER · {} → {:.0}/$", paper(dp), money(ds), if ds > 0.0 { dp / ds } else { 0.0 })));
         s.push_str(&row("pace", format!("{} PAPER/h · ~{}/day · avg cycle {}", paper(pap / hours), paper(pap / hours * 24.0), dur((secs / n as f64) as u64))));
+        let first_open = rows.first().map(|r| r["ts"].as_f64().unwrap_or(now) - r["elapsed_s"].as_f64().unwrap_or(0.0)).unwrap_or(now);
+        let in_pair_24h: f64 = day.iter().map(|r| r["elapsed_s"].as_f64().unwrap_or(0.0).min(86_400.0)).sum();
+        s.push_str(&row("uptime", format!("{:.0}% of the time in a pair all-time · {:.0}% last 24h", secs / (now - first_open).max(1.0) * 100.0, in_pair_24h.min(86_400.0) / 864.0)));
         for coin in ["BTC", "ETH"] {
             let rs: Vec<_> = rows.iter().filter(|r| r["coin"] == coin).cloned().collect();
             if rs.is_empty() { continue; }
@@ -693,14 +934,60 @@ impl Commander {
         s.push_str(&row("best / worst", format!("{} / {}", signed(best), signed(worst))));
         if let Ok(sum) = self.api.summary().await {
             let st = self.state();
-            let held = if let Some(u) = st.user { self.api.account_row(u).await.map(|a| a.paper_raw as f64 / 1e18).unwrap_or(pap) } else { pap };
-            let share = held / sum.supply.max(1.0);
+            let total = if let Some(u) = st.user { self.api.account_row(u).await.map(|a| a.paper_raw as f64 / 1e18).unwrap_or(pap) } else { pap };
+            let share = total / sum.supply.max(1.0);
             s.push_str("\n");
-            s.push_str(&row("PAPER held", format!("{} · {:.4}% of {:.2}B supply", paper(held), share * 100.0, sum.supply / 1e9)));
+            s.push_str(&row("total PAPER", format!("<b>{}</b> all-time · {} outside the bot · {:.4}% of {:.2}B supply", paper(total.max(pap)), paper((total - pap).max(0.0)), share * 100.0, sum.supply / 1e9)));
             let theo = 0.98 * sum.mint_rate() / (1.0 - keep_frac(self.params().move_pct / 100.0, 814.598));
             s.push_str(&row("vs model", format!("{:.0} PAPER/$ at today's rate and move (BTC)", theo)));
         }
         s
+    }
+
+    /// Account-wide brag numbers: (total PAPER, $ per PAPER, PAPER per $, protocol rate, volume, cycles, liqs, days farming, supply share).
+    /// Totals come from the leaderboard row, so PAPER from manual trades counts; the ledger only supplies cycle counts.
+    async fn flex_numbers(&self) -> Option<(f64, f64, f64, f64, f64, usize, usize, f64, f64)> {
+        let u = self.state().user?;
+        let (a, sum) = tokio::join!(self.api.account_row(u), self.api.summary());
+        let (a, sum) = (a.ok()?, sum.ok()?);
+        let rows = ledger_rows(&self.ledger_path);
+        let (n, pap, spent, _) = self.totals(&rows);
+        let total = (a.paper_raw as f64 / 1e18).max(pap);
+        let cost = (-a.realized_pnl_usd).max(spent);
+        let liqs = rows.iter().filter(|r| r["kinds"].as_array().map(|k| k.iter().any(|x| x == "Liquidated")).unwrap_or(false)).count();
+        let now = crate::sign::now_secs() as f64;
+        let first = rows.first().map(|r| r["ts"].as_f64().unwrap_or(now) - r["elapsed_s"].as_f64().unwrap_or(0.0)).unwrap_or(now);
+        Some((total, if total > 0.0 { cost / total } else { 0.0 }, if cost > 0.0 { total / cost } else { 0.0 }, sum.mint_rate(), a.volume_usd, n, liqs,
+            ((now - first) / 86_400.0).max(0.01), total / sum.supply.max(1.0) * 100.0))
+    }
+
+    async fn flex(&self) -> String {
+        let Some((total, per, eff, rate, vol, n, liqs, days, share)) = self.flex_numbers().await else { return format!("{}nothing to flex yet", h("💅 Flex")) };
+        let mut s = h("💅 Flex");
+        s.push_str(&row("PAPER", format!("<b>{}</b> all-time · {:.4}% of supply", paper(total), share)));
+        s.push_str(&row("efficiency", format!("<b>{eff:.0} PAPER per $</b> · {:.1}× the protocol rate ({rate:.1}/$)", if rate > 0.0 { eff / rate } else { 0.0 })));
+        s.push_str(&row("cost", format!("${per:.4} per PAPER")));
+        s.push_str(&row("cycles", format!("{n} · {liqs} liquidated")));
+        s.push_str(&row("volume", compact_money(vol)));
+        s.push_str(&row("pace", format!("{} PAPER/day over {:.1} days", paper(total / days), days)));
+        s
+    }
+
+    async fn flex_card(&self) -> Option<crate::card::Card> {
+        use crate::card::{Card, PINK};
+        let (total, per, eff, rate, vol, n, liqs, days, share) = self.flex_numbers().await?;
+        Some(Card {
+            kicker: "UwU bot · flex".into(), hero: paper(total), hero_unit: "PAPER".into(),
+            sub: format!("{eff:.0} PAPER per $ · {:.1}× the protocol rate", if rate > 0.0 { eff / rate } else { 0.0 }),
+            chips: vec![
+                ("cycles".into(), format!("{n} · {liqs} liq")),
+                ("volume".into(), compact_money(vol)),
+                ("per PAPER".into(), format!("${per:.4}")),
+                ("PAPER/day".into(), paper(total / days)),
+            ],
+            footer: format!("{share:.4}% of supply · {:.1} days farming · protocol rate today {rate:.1}/$", days),
+            progress: None, accent: PINK,
+        })
     }
 
     async fn rate(&self) -> String {
@@ -801,13 +1088,13 @@ impl Commander {
                 }
                 let pp = Params::path(&self.state_path);
                 let mut p = self.params();
-                p.paused = true;
+                p.pause(&format!("liquidated by {name}"));
                 p.liquidate = true;
                 if let Err(e) = p.save(&pp) {
                     return format!("could not write params: {e}");
                 }
                 let _ = self.n.send_now(&format!("🛑 <b>Liquidate confirmed</b> by {name} — pausing and closing…")).await;
-                let engine_alive = heartbeat_age(&self.state_path).map(|a| a <= 5).unwrap_or(false);
+                let engine_alive = heartbeat_age(&self.state_path).map(|a| a <= 15).unwrap_or(false);
                 if engine_alive && open > 0 {
                     for _ in 0..20 {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -819,20 +1106,24 @@ impl Commander {
                 let still_open = self.api.account_row(user).await.map(|a| a.open_positions).unwrap_or(open);
                 let note: String;
                 if still_open > 0 {
-                    let (_tx, rx) = tokio::sync::watch::channel(false);
-                    match (Chain::new(&crate::positions::rpc_url()), self.feed.clone()) {
-                        (Ok(chain), Some(feed)) => match Engine::new(self.api.clone(), chain, feed, self.state(), RunArgs::parse_from(["run"]), self.state_path.clone(), self.ledger_path.clone(), rx) {
-                            Ok(mut eng) => { note = match eng.close_all().await { Ok(()) => "closed from the responder".into(), Err(e) => format!("close-all failed: {e}") } }
-                            Err(e) => note = format!("engine: {e}"),
+                    note = match Chain::new(&crate::positions::rpc_url()) {
+                        Ok(chain) => match close_detached(&self.api, &chain, &self.state()).await {
+                            Ok(ids) => format!("close posted from the responder for {}", ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(", ")),
+                            Err(e) => format!("close failed: {e}"),
                         },
-                        _ => note = "no feed/rpc in this process".into(),
+                        Err(e) => format!("no rpc: {e}"),
+                    };
+                    // the relayer may sit on it; the engine reconciles the record when it executes
+                    for _ in 0..30 {
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        if self.api.account_row(user).await.map(|a| a.open_positions == 0).unwrap_or(false) { break; }
                     }
                 } else {
                     note = if engine_alive { "closed by the engine".into() } else { "nothing was open".into() };
                 }
                 if let Some(mut p) = Params::load(&pp) {
                     p.liquidate = false;
-                    p.paused = true;
+                    if !p.paused { p.pause(&format!("liquidated by {name}")); }
                     let _ = p.save(&pp);
                 }
                 let after = self.api.account_row(user).await.ok();

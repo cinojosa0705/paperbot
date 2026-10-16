@@ -1,4 +1,6 @@
 //! exchange.papertrade.xyz client: public reads under /query and /state, writes to /intents.
+//! Every client is HTTP/1.1 over IPv4: the operator's hotspot drops IPv6 packets at random and a
+//! timed-out request on a multiplexed h2 connection never closed it (15 h of dead Telegram polls).
 
 use alloy::primitives::Address;
 use anyhow::{anyhow, Context, Result};
@@ -35,6 +37,7 @@ pub struct Summary {
     pub tracked_lp_usd: f64,
     pub queue_usd: f64,
     pub supply: f64,
+    pub staked: f64,
     pub block: u64,
 }
 impl Summary {
@@ -102,7 +105,13 @@ pub struct AccountRow {
     pub balance_raw: u128,
     pub queued_raw: u128,
     pub open_positions: u32,
+    /// false when the indexer row has no `currentOpenPositionCount` and the count was inferred from notional
+    pub open_count_exact: bool,
+    pub open_notional_usd: f64,
     pub paper_raw: u128,
+    pub realized_pnl_usd: f64,
+    pub volume_usd: f64,
+    pub rank: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -114,6 +123,9 @@ pub struct IntentAck {
     pub queue_revision: Value,
 }
 
+fn sign_now_ms() -> u64 {
+    crate::sign::now_secs() * 1000
+}
 fn raw_u128(v: &Value) -> Result<u128> {
     v.as_str()
         .ok_or_else(|| anyhow!("expected string, got {v}"))?
@@ -126,7 +138,7 @@ fn raw_usd(v: &Value) -> Result<f64> {
 
 impl Api {
     pub fn new(base: &str) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let http = reqwest::Client::builder().http1_only().local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
             .timeout(Duration::from_secs(10))
             .user_agent("paperbot/0.1")
             .build()?;
@@ -155,6 +167,7 @@ impl Api {
             tracked_lp_usd: raw_usd(&v["paper"]["trackedLp"])?,
             queue_usd: raw_usd(&v["balances"]["queue"])?,
             supply: raw_usd(&v["paper"]["supply"])?,
+            staked: raw_usd(&v["paper"]["staked"]).unwrap_or(0.0),
             block: v["source"]["block"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0),
         })
     }
@@ -243,12 +256,93 @@ impl Api {
         if r.is_null() {
             return Err(anyhow!("account {user:#x} not indexed yet (no deposit?)"));
         }
+        // the indexer dropped `currentOpenPositionCount` once (2026-10-13); notional is the fallback
+        let open_notional_usd = raw_usd(&r["currentOpenNotional"]).unwrap_or(0.0);
+        let (open_positions, open_count_exact) = match r["currentOpenPositionCount"].as_u64() {
+            Some(n) => (n as u32, true),
+            None if r["currentOpenNotional"].is_string() => (if open_notional_usd > 0.0 { 2 } else { 0 }, false),
+            None => return Err(anyhow!("account row has neither open count nor open notional")),
+        };
         Ok(AccountRow {
             balance_raw: raw_u128(&r["currentBalance"])?,
             queued_raw: raw_u128(&r["currentQueued"]).unwrap_or(0),
-            open_positions: r["currentOpenPositionCount"].as_u64().unwrap_or(0) as u32,
+            open_positions: open_positions,
+            open_count_exact,
+            open_notional_usd,
             paper_raw: raw_u128(&r["paperTotal"]).unwrap_or(0),
+            realized_pnl_usd: r["realizedPnl"].as_str().and_then(|s| s.parse::<i128>().ok()).unwrap_or(0) as f64 / E18,
+            volume_usd: raw_usd(&r["totalVolume"]).unwrap_or(0.0),
+            rank: r["_leaderboardRank"].as_u64(),
         })
+    }
+
+    /// Intents the relayer has accepted for this account but not executed yet
+    /// (`/query/accounts/{addr}/queue`). Opens have sat here for 39 min.
+    pub async fn queued(&self, user: Address) -> Result<usize> {
+        let v = self.get_value(&format!("/query/accounts/{user:#x}/queue")).await?;
+        Ok(v["items"].as_array().map(|a| a.len()).unwrap_or(0))
+    }
+
+    /// PAPER currently staked: the account's stake events netted (`/query/accounts/{addr}/staking`).
+    pub async fn staked_paper(&self, user: Address) -> Result<f64> {
+        let v = self.get_value(&format!("/query/accounts/{user:#x}/staking")).await?;
+        let mut total = 0.0;
+        for it in v["items"].as_array().into_iter().flatten() {
+            let amt = raw_usd(&it["amountRaw"]).unwrap_or(0.0);
+            total += if it["kind"] == "staked" { amt } else { -amt };
+        }
+        Ok(total.max(0.0))
+    }
+
+    /// Hyperliquid's REST mid for `coin`: the fallback price while the websocket is silent.
+    pub async fn rest_mid(&self, coin: &str) -> Result<f64> {
+        let v: Value = self
+            .http
+            .post("https://api.hyperliquid.xyz/info")
+            .json(&json!({"type": "allMids"}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        v[coin].as_str().and_then(|s| s.parse().ok()).ok_or_else(|| anyhow!("no mid for {coin}"))
+    }
+
+    /// Worst adverse move (fraction) from any 1-minute close to any high/low within the next
+    /// `window_s` seconds, over the last `days` days of Hyperliquid candles. This is the empirical
+    /// tail the close path must survive while the relayer sits on a queued close.
+    pub async fn worst_move(&self, coin: &str, window_s: u64, days: u64) -> Result<f64> {
+        let now = sign_now_ms();
+        let v: Value = self
+            .http
+            .post("https://api.hyperliquid.xyz/info")
+            .json(&json!({"type": "candleSnapshot", "req": {"coin": coin, "interval": "1m", "startTime": now - days * 86_400_000, "endTime": now}}))
+            .send()
+            .await?
+            .json()
+            .await?;
+        let f = |c: &Value, k: &str| c[k].as_str().and_then(|s| s.parse::<f64>().ok());
+        let mut rows: Vec<(u64, f64, f64, f64)> = v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| Some((c["t"].as_u64()?, f(c, "c")?, f(c, "h")?, f(c, "l")?)))
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        if rows.len() < 600 {
+            anyhow::bail!("only {} candles for {coin}", rows.len());
+        }
+        let w = (window_s as usize).div_ceil(60).max(1);
+        let mut worst: f64 = 0.0;
+        for i in 0..rows.len().saturating_sub(w) {
+            let e = rows[i].1;
+            let (mut hi, mut lo) = (e, e);
+            for r in &rows[i + 1..i + 1 + w] {
+                hi = hi.max(r.2);
+                lo = lo.min(r.3);
+            }
+            worst = worst.max(hi / e - 1.0).max(1.0 - lo / e);
+        }
+        Ok(worst)
     }
 
     /// Latest closed positions, newest first. The route only accepts its default page (or `limit=75`).

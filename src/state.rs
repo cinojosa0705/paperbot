@@ -33,6 +33,16 @@ pub struct State {
     pub session_expiry: Option<u64>,
     pub nonce: Option<U256>,
     pub cycles_done: u64,
+    /// slowest relayer execution seen so far (close submit → legs gone, or open ack → positions visible),
+    /// seconds; sizes the next pair's bust headroom
+    #[serde(default)]
+    pub worst_close_s: u64,
+    /// highest equity seen, raw; the drawdown stop measures from here across restarts
+    #[serde(default)]
+    pub peak_equity: u128,
+    /// ledger rows written before the trades route had indexed them; backfilled when idle
+    #[serde(default)]
+    pub partial_cycles: Vec<u64>,
     pub in_flight: Option<InFlight>,
 }
 
@@ -81,6 +91,15 @@ pub fn ledger_rows(path: &Path) -> Vec<serde_json::Value> {
         .unwrap_or_default()
 }
 
+/// Rewrite the whole ledger (small file): used to backfill a partial row.
+pub fn ledger_rewrite(path: &Path, rows: &[serde_json::Value]) -> Result<()> {
+    let tmp = path.with_extension("jsonl.tmp");
+    let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(tmp, path)?;
+    Ok(())
+}
+
 /// Live-tunable farm parameters — the one file Telegram `/set`, the GUI and the engine agree on.
 /// The engine re-reads it at the top of every cycle; changes apply to the next pair.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -91,16 +110,21 @@ pub struct Params {
     pub buffer_pct: f64,
     pub capital_fraction: f64,
     pub drawdown_stop_pct: f64,
+    /// hard dollar floor: stop when equity is at or below this (0 = off)
+    pub min_balance_usd: f64,
     pub rate_floor: f64,
     pub max_cycles: Option<u64>,
     pub paused: bool,
     /// set by /liquidate: the engine closes its pair, clears the flag and stays paused
     pub liquidate: bool,
+    /// why the farm is paused (operator, drawdown stop, watchdog …) and since when
+    pub pause_reason: Option<String>,
+    pub paused_at: Option<u64>,
 }
 
 impl Default for Params {
     fn default() -> Self {
-        Self { market: "auto".into(), move_pct: 0.5, buffer_pct: 25.0, capital_fraction: 1.0, drawdown_stop_pct: 60.0, rate_floor: 10.0, max_cycles: None, paused: false, liquidate: false }
+        Self { market: "auto".into(), move_pct: 0.5, buffer_pct: 25.0, capital_fraction: 1.0, drawdown_stop_pct: 60.0, min_balance_usd: 0.0, rate_floor: 10.0, max_cycles: None, paused: false, liquidate: false, pause_reason: None, paused_at: None }
     }
 }
 
@@ -112,14 +136,34 @@ impl Params {
         serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
     }
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, serde_json::to_string_pretty(self)?).context("write params")
+        // atomic: the engine re-reads this file every few seconds
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, serde_json::to_string_pretty(self)?).context("write params")?;
+        std::fs::rename(tmp, path).context("rename params")
+    }
+    pub fn pause(&mut self, why: &str) {
+        self.paused = true;
+        self.pause_reason = Some(why.to_string());
+        self.paused_at = Some(crate::sign::now_secs());
+    }
+    pub fn resume(&mut self) {
+        self.paused = false;
+        self.pause_reason = None;
+        self.paused_at = None;
+    }
+    /// "btc+" / "eth+": that market first, the other one when the relayer refuses it.
+    pub fn preferred_market(&self) -> (&str, bool) {
+        match self.market.strip_suffix('+') {
+            Some(m) => (m, true),
+            None => (self.market.as_str(), false),
+        }
     }
     /// Minimum buffer so the close lands ≥0.10% before the 5 bps bust trigger (the engine enforces it too).
     pub fn min_buffer_pct(move_pct: f64) -> f64 {
         (crate::engine::min_buffer(move_pct / 100.0) * 100.0).ceil()
     }
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if !matches!(self.market.as_str(), "auto" | "btc" | "eth") { return Err("market must be auto, btc or eth".into()); }
+        if !matches!(self.market.as_str(), "auto" | "btc" | "eth" | "btc+" | "eth+") { return Err("market must be auto, btc, eth, btc+ or eth+ (+ = fall back to the other market when refused)".into()); }
         if !(0.01..=20.0).contains(&self.move_pct) { return Err("move must be 0.01–20 (%)".into()); }
         let min_buf = Self::min_buffer_pct(self.move_pct);
         if self.buffer_pct < min_buf { return Err(format!("buffer must be ≥ {min_buf:.0}% for a {:.2}% move (bust guard)", self.move_pct)); }
@@ -127,6 +171,7 @@ impl Params {
         if !(0.01..=1.0).contains(&self.capital_fraction) { return Err("capital must be 0.01–1".into()); }
         if !(1.0..=100.0).contains(&self.drawdown_stop_pct) { return Err("ddstop must be 1–100 (%)".into()); }
         if self.rate_floor < 0.0 { return Err("ratefloor must be ≥ 0".into()); }
+        if self.min_balance_usd < 0.0 { return Err("minbalance must be ≥ 0 ($)".into()); }
         Ok(())
     }
     /// `/set key value` — returns the human message for the change.
@@ -138,9 +183,10 @@ impl Params {
             "market" => self.market = value.to_lowercase(),
             "capital" | "cap" => self.capital_fraction = f()?,
             "ddstop" | "dd" => self.drawdown_stop_pct = f()?,
-            "ratefloor" | "floor" => self.rate_floor = f()?,
+            "ratefloor" => self.rate_floor = f()?,
+            "minbalance" | "minbal" | "stopat" => self.min_balance_usd = if value == "off" { 0.0 } else { f()? },
             "maxcycles" | "max" => self.max_cycles = if value == "off" { None } else { Some(value.parse().map_err(|_| "maxcycles: integer or off".to_string())?) },
-            _ => return Err(format!("unknown key {key:?} — move · buffer · market · capital · ddstop · ratefloor · maxcycles")),
+            _ => return Err(format!("unknown key {key:?} — move · buffer · market (auto|btc|eth|btc+|eth+) · capital · ddstop · minbalance · ratefloor · maxcycles")),
         }
         self.validate()?;
         Ok(self.summary())
@@ -148,9 +194,9 @@ impl Params {
     pub fn summary(&self) -> String {
         let lev = ((1.0 / (self.move_pct / 100.0 * (1.0 + self.buffer_pct / 100.0))).round() as u32).clamp(1, 1000);
         format!(
-            "{}{} · move {:.2}% · buffer {:.0}% ({lev}×) · capital ×{:.2} · dd stop {:.0}% · rate floor {:.1} · max cycles {}",
+            "{}{} · move {:.2}% · buffer {:.0}% ({lev}×) · capital ×{:.2} · dd stop {:.0}%{} · rate floor {:.1} · max cycles {}",
             if self.paused { "⏸ paused · " } else { "" }, self.market, self.move_pct, self.buffer_pct, self.capital_fraction,
-            self.drawdown_stop_pct, self.rate_floor, self.max_cycles.map(|m| m.to_string()).unwrap_or("off".into())
+            self.drawdown_stop_pct, if self.min_balance_usd > 0.0 { format!(" · min balance ${:.0}", self.min_balance_usd) } else { String::new() }, self.rate_floor, self.max_cycles.map(|m| m.to_string()).unwrap_or("off".into())
         )
     }
 }
@@ -160,7 +206,12 @@ pub fn heartbeat_path(state_path: &Path) -> PathBuf {
     state_path.with_file_name("heartbeat")
 }
 pub fn heartbeat_touch(state_path: &Path) {
-    let _ = std::fs::write(heartbeat_path(state_path), crate::sign::now_secs().to_string());
+    // written whole then renamed: a reader never sees a torn (empty) file
+    let p = heartbeat_path(state_path);
+    let tmp = p.with_extension("tmp");
+    if std::fs::write(&tmp, crate::sign::now_secs().to_string()).is_ok() {
+        let _ = std::fs::rename(tmp, p);
+    }
 }
 /// Seconds since the engine last beat, if ever.
 pub fn heartbeat_age(state_path: &Path) -> Option<u64> {

@@ -8,8 +8,9 @@ AGENTS="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS" "$HOME/.paperbot"
 # shellcheck disable=SC1090
 . "$ENV_FILE"
-STATE="${PAPERBOT_STATE_FILE:-$REPO/state.json}"
-LEDGER="${PAPERBOT_LEDGER_FILE:-$REPO/ledger.jsonl}"
+STATE="${PAPERBOT_STATE:-$HOME/.paperbot/state.json}"
+LEDGER="${PAPERBOT_LEDGER:-$HOME/.paperbot/ledger.jsonl}"
+[ -f "$STATE" ] || { echo "no $STATE — run \`paperbot register\` first, or move an existing state.json/ledger.jsonl/params.json there"; exit 1; }
 env_xml() {
   for k in PAPERBOT_API PAPERBOT_TG_TOKEN PAPERBOT_TG_CHAT PAPERBOT_TG_USERS PAPERBOT_RPC PAPERBOT_RPC_LOG_RANGE RUST_LOG; do
     v="$(eval "printf '%s' \"\${$k:-}\"")"; [ -n "$v" ] && printf '    <key>%s</key><string>%s</string>\n' "$k" "$v"
